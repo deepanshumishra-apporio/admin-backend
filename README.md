@@ -83,3 +83,21 @@ queries every few minutes keeps it awake around the clock, which uses up the fre
 background jobs here stay off the database: valuations live in memory, each investor id is saved once, and a compliance
 scan that finds what the last one found writes nothing. The database wakes for staff using the dashboard, a scan with
 new findings, and the 6-hourly deep scan.
+
+## Running on the Azure VM (74.225.175.227)
+
+Deployed 2026-10-21 as the Docker container `admin-backend` (the VM's own Node is 22; the image has Node 24). It listens
+on `127.0.0.1:3005` only, uses host networking, and restarts on its own. Secrets are in `~/admin-backend/.env` (mode 600).
+
+```bash
+# update to the latest main
+ssh -i ~/.ssh/vps_key azureuser@74.225.175.227
+cd ~/admin-backend && git pull && sudo docker build -t admin-backend . \
+  && sudo docker rm -f admin-backend && sudo docker run -d --name admin-backend --restart unless-stopped \
+     --network host --env-file .env --log-opt max-size=10m --log-opt max-file=3 admin-backend
+sudo docker logs -f admin-backend                       # logs
+sudo docker exec -e STAFF_EMAIL=... -e STAFF_NAME="..." admin-backend node scripts/create-staff.ts   # a staff login
+```
+
+From a laptop: `ssh -i ~/.ssh/vps_key -f -N -L 13005:127.0.0.1:3005 azureuser@74.225.175.227`, then the dashboard's
+`ADMIN_API_URL=http://127.0.0.1:13005`.
