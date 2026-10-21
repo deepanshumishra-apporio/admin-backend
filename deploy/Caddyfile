@@ -1,0 +1,13 @@
+# HTTPS in front of the admin backend on the Azure VM. Caddy gets and renews the certificate itself
+# (needs ports 80 and 443 open to the internet). The dashboard on Vercel sets ADMIN_API_URL=https://74-225-175-227.sslip.io
+74-225-175-227.sslip.io {
+	# Only the admin API and its health check exist; everything else is refused.
+	@api path /api/v1/admin/* /health
+	handle @api {
+		reverse_proxy 127.0.0.1:3005
+	}
+	handle {
+		respond 404
+	}
+	header -Server
+}
