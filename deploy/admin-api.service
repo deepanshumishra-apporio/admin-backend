@@ -1,0 +1,21 @@
+# systemd unit for the admin API on the AWS admin server, next to admin-web.
+# Install: sudo cp deploy/admin-api.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now admin-api
+[Unit]
+Description=RiSips admin API (backend for admin-web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=admin
+WorkingDirectory=/opt/admin/api
+EnvironmentFile=/etc/admin/admin-api.env
+ExecStart=/usr/bin/node --use-env-proxy --disable-warning=ExperimentalWarning src/server.ts
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

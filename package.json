@@ -1,0 +1,26 @@
+{
+  "name": "admin-risips-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Backend for the RiSips admin dashboard (admin-risips). Investor data comes only from the app backend's read-only Admin API; staff, roles, tickets, alerts, announcements and meetings live in its own SQLite database.",
+  "engines": {
+    "node": ">=24.5"
+  },
+  "scripts": {
+    "//": "Node runs the TypeScript directly (type stripping). There is no build step and there are no dependencies.",
+    "start": "node --env-file-if-exists=.env --use-env-proxy --disable-warning=ExperimentalWarning src/server.ts",
+    "dev": "node --env-file-if-exists=.env --use-env-proxy --disable-warning=ExperimentalWarning --watch src/server.ts",
+    "staff:create": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning scripts/create-staff.ts",
+    "test": "node --env-file-if-exists=.env --use-env-proxy --disable-warning=ExperimentalWarning --test test/*.test.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.8.3"
+  }
+}
