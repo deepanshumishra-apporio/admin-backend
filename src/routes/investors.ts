@@ -3,6 +3,8 @@ import { actorOf, audit, authenticate, need } from '../auth.ts';
 import { Csv, HttpError, listParam, page, pageParams, toCsv, uuidParam, type Router } from '../http.ts';
 import { investorExtId, snapshot, type Snapshot } from '../investors.ts';
 import {
+  findInstallment,
+  installmentToOrder,
   investorDetail,
   isOrder,
   istDate,
@@ -31,10 +33,43 @@ import {
   type JourneyStage,
 } from '../map.ts';
 import { uuidFor } from '../security.ts';
-import { investorDetail as fetchDetail, portfolio, type UpOrder } from '../upstream.ts';
+import { investorDetail as fetchDetail, portfolio, type UpDetailResponse, type UpOrder } from '../upstream.ts';
 import { currentValues, valuationAsOf } from '../valuation.ts';
 
 const DayMs = 86_400_000;
+
+/** A SIP, SWP or STP instalment opened from a transactions or orders row: it lives on its plan, not as an order. */
+function installmentItem(plans: UpOrder[], itemId: string, type: string, bank: UpDetailResponse['investor']['bank']) {
+  const found = findInstallment(plans, itemId);
+  if (!found) throw HttpError.notFound('That order could not be found.');
+  const { plan, installment: i, index } = found;
+  const order = installmentToOrder(plan, i, index);
+  if (order.kind.toLowerCase() !== type) throw HttpError.notFound('That order could not be found.');
+  const text = (key: string) => (typeof i[key] === 'string' && i[key] ? (i[key] as string) : null);
+  return {
+    type: 'order',
+    order: {
+      ...order,
+      fpId: text('id') ?? plan.id,
+      sourceRefId: null,
+      gateway: null,
+      subtype: i['upfront'] === true ? 'first_instalment' : null,
+      failureCode: text('failure_code'),
+      navDate: text('traded_on'),
+      scheduledOn: text('scheduled_on'),
+      tradedOn: text('traded_on'),
+      initiatedBy: null,
+      initiatedVia: null,
+      consent: null,
+      payoutAccount: plan.kind === 'swp' && bank ? { accountNumber: bank.account_masked, ifsc: bank.ifsc } : null,
+      plan: { id: uuidFor('plan', plan.id), kind: toPlan(plan).kind, scheme: order.scheme },
+      payments: [],
+      events: [],
+      schemeFacts: schemeFacts(plan.fund, plan.isin),
+    },
+  };
+}
+
 const SetupStages = new Set<JourneyStage>(['KYC_COMPLETED', 'PROFILE', 'ACCOUNT_SETUP']);
 
 function istStartOfToday(): number {
@@ -274,7 +309,7 @@ export function investorRoutes(router: Router): void {
 
     if (type === 'purchase' || type === 'redemption' || type === 'switch') {
       const o = resp.orders.find((x) => x.kind === type && uuidFor('order', x.id) === itemId);
-      if (!o) throw HttpError.notFound('That order could not be found.');
+      if (!o) return installmentItem(plans, itemId, type, bank);
       const payments = paymentGroups(resp.orders).filter((g) => g.orders.some((x) => x.id === o.id)).map(toPayment);
       return {
         type: 'order',

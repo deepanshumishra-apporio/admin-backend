@@ -169,7 +169,7 @@ export function toOrder(o: UpOrder) {
 }
 
 /** One instalment of a plan, as an order row. */
-function installmentToOrder(plan: UpOrder, i: Record<string, unknown>, index: number) {
+export function installmentToOrder(plan: UpOrder, i: Record<string, unknown>, index: number) {
   const kind: OrderKind = plan.kind === 'swp' ? 'REDEMPTION' : plan.kind === 'stp' ? 'SWITCH' : 'PURCHASE';
   const state = textOf(i['state']) ?? 'pending';
   const id = textOf(i['id']) ?? `${plan.id}#${index}`;
@@ -368,18 +368,35 @@ export const FlagLabels: Record<OrderFlag, string> = {
   AWAITING_INVESTOR: 'Waiting on investor',
 };
 
-/** The same rules as the original API, timed from `updated_at` (the Admin API has no per-state timestamps). */
-export function flagOf(o: UpOrder, now = Date.now()): OrderFlag | null {
-  const since = now - ms(o.updated_at);
-  const placed = now - ms(o.created_at);
-  if (o.state === 'failed' || o.state === 'reversed') return 'FAILED';
-  if (o.kind === 'purchase' && (o.state === 'pending' || o.state === 'under_review') && o.payment?.status === 'SUCCESS' && since > HourMs) {
+type FlagInput = {
+  kind: string;
+  state: string;
+  paymentStatus: string | null;
+  updatedMs: number;
+  placedMs: number;
+  /** False for mandate and scheduled instalments: nobody waits on the investor to consent or pay for those. */
+  investorActs: boolean;
+};
+
+function flagFor(x: FlagInput, now: number): OrderFlag | null {
+  const since = now - x.updatedMs;
+  const placed = now - x.placedMs;
+  if (x.state === 'failed' || x.state === 'reversed') return 'FAILED';
+  if (x.kind === 'purchase' && (x.state === 'pending' || x.state === 'under_review') && x.paymentStatus === 'SUCCESS' && since > HourMs) {
     return 'PAID_NOT_CONFIRMED';
   }
-  if (o.state === 'confirmed' && since > 24 * HourMs) return 'NOT_SUBMITTED';
-  if (o.state === 'submitted' && since > 72 * HourMs) return 'STUCK_AT_RTA';
-  if ((o.state === 'pending' || o.state === 'under_review') && placed > 24 * HourMs) return 'AWAITING_INVESTOR';
+  if (x.state === 'confirmed' && since > 24 * HourMs) return 'NOT_SUBMITTED';
+  if (x.state === 'submitted' && since > 72 * HourMs) return 'STUCK_AT_RTA';
+  if (x.investorActs && (x.state === 'pending' || x.state === 'under_review') && placed > 24 * HourMs) return 'AWAITING_INVESTOR';
   return null;
+}
+
+/** The same rules as the original API, timed from `updated_at` (the Admin API has no per-state timestamps). */
+export function flagOf(o: UpOrder, now = Date.now()): OrderFlag | null {
+  return flagFor(
+    { kind: o.kind, state: o.state, paymentStatus: o.payment?.status ?? null, updatedMs: ms(o.updated_at), placedMs: ms(o.created_at), investorActs: true },
+    now,
+  );
 }
 
 export const MonitorStates = ['UNDER_REVIEW', 'PENDING', 'CONFIRMED', 'SUBMITTED', 'SUCCESSFUL', 'FAILED', 'CANCELLED', 'REVERSED'] as const;
@@ -391,7 +408,7 @@ export function toMonitored(o: UpOrder, f: Facts | undefined) {
   return {
     id: uuidFor('order', o.id),
     kind: o.kind as 'purchase' | 'redemption' | 'switch',
-    type: OrderKinds[o.kind as keyof typeof OrderKinds],
+    type: OrderKinds[o.kind as keyof typeof OrderKinds] as (typeof OrderTypes)[number],
     investor: { id: uuidFor('investor', o.user_id), name: f?.up.name ?? null, pan: f?.up.pan_masked ?? null },
     scheme: schemeName(o.fund, o.isin),
     toScheme: o.fund_to ? o.fund_to.name : null,
@@ -411,6 +428,101 @@ export function toMonitored(o: UpOrder, f: Facts | undefined) {
     updatedAt: iso(o.updated_at)!,
     completedAt: o.state === 'successful' ? iso(o.succeeded_at) ?? iso(o.updated_at) : null,
   };
+}
+
+export type Monitored = ReturnType<typeof toMonitored>;
+
+/** A transactions row: the view the dashboard gets, plus what the list's filters, search and summary work from. */
+export type MonitorRow = {
+  view: Monitored;
+  /** The app backend's id for the order, or for the plan an instalment belongs to (what "refresh" re-reads). */
+  refreshId: string;
+  placedMs: number;
+  updatedMs: number;
+  /** Real payments only, which one-time orders carry; the summary's payment figures count these. */
+  payment: UpOrder['payment'] | null;
+  amount: number;
+  search: string;
+};
+
+export function monitorOrder(o: UpOrder, f: Facts | undefined): MonitorRow {
+  const view = toMonitored(o, f);
+  return {
+    view,
+    refreshId: o.id,
+    placedMs: ms(o.created_at),
+    updatedMs: ms(o.updated_at),
+    payment: o.payment ?? null,
+    amount: Number(o.amount ?? 0),
+    search: [o.ref, o.id, o.isin, o.folio, view.scheme, view.investor.name, view.investor.pan].filter(Boolean).join(' ').toLowerCase(),
+  };
+}
+
+const InstallmentKinds = { sip: 'purchase', swp: 'redemption', stp: 'switch' } as const;
+const InstallmentTypes = { sip: 'SIP_INSTALLMENT', swp: 'SWP_INSTALLMENT', stp: 'STP_INSTALLMENT' } as const;
+
+/**
+ * Every instalment of a SIP, SWP or STP as a transactions row. Instalments carry no created_at or updated_at, so they
+ * are timed from FP's timestamps when the app passes them on, else from the plan's set-up (the up-front SIP payment)
+ * or the scheduled date. Only a SIP's up-front instalment has a payment, recorded on the plan.
+ */
+export function monitorInstallments(plan: UpOrder, f: Facts | undefined, now = Date.now()): MonitorRow[] {
+  const planKind = plan.kind as keyof typeof InstallmentKinds;
+  if (!(planKind in InstallmentKinds)) return [];
+  return installmentOrders(plan).map((i, index) => {
+    const extId = textOf(i['id']) ?? `${plan.id}#${index}`;
+    const state = (textOf(i['state']) ?? 'pending').toLowerCase();
+    const upfront = i['upfront'] === true;
+    const scheduled = textOf(i['scheduled_on']);
+    const placedMs = ms(i['created_at']) || (upfront ? ms(plan.created_at) : 0) || (scheduled ? Date.parse(`${scheduled}T00:00:00+05:30`) : ms(plan.created_at));
+    const updatedMs = Math.max(placedMs, ...['submitted_at', 'confirmed_at', 'succeeded_at', 'failed_at', 'traded_on'].map((k) => ms(i[k])));
+    const paymentStatus = !upfront ? null : plan['first_payment_failed'] === true ? 'FAILED' : plan['first_payment_received'] === true ? 'SUCCESS' : 'PENDING';
+    const kind = InstallmentKinds[planKind];
+    const amount = money(i['amount'] ?? plan.amount);
+    const done = state === 'successful';
+    const view: Monitored = {
+      id: uuidFor('order', extId),
+      kind,
+      type: InstallmentTypes[planKind],
+      investor: { id: uuidFor('investor', plan.user_id), name: f?.up.name ?? null, pan: f?.up.pan_masked ?? null },
+      scheme: schemeName(plan.fund, plan.isin),
+      toScheme: plan.fund_to ? plan.fund_to.name : null,
+      folio: textOf(i['folio']) ?? plan.folio ?? null,
+      amount,
+      units: null,
+      allUnits: false,
+      estimatedAmount: null,
+      processedAmount: money(i['purchased_amount']) ?? (done ? amount : null),
+      processedUnits: unitsOf(i['units'] ?? i['units_out']),
+      state: state.toUpperCase() as (typeof MonitorStates)[number],
+      gateway: config.orderGateway,
+      payment: paymentStatus ? { status: paymentStatus, at: null } : null,
+      flag: flagFor({ kind, state, paymentStatus, updatedMs, placedMs, investorActs: upfront }, now),
+      failureReason: textOf(i['failure_code']) ? FailureLabels[i['failure_code'] as string] ?? humanise(i['failure_code'] as string) : null,
+      placedAt: new Date(placedMs).toISOString(),
+      updatedAt: new Date(updatedMs).toISOString(),
+      completedAt: done ? iso(i['succeeded_at']) ?? iso(i['traded_on']) : null,
+    };
+    return {
+      view,
+      refreshId: plan.id,
+      placedMs,
+      updatedMs,
+      payment: null,
+      amount: Number(amount ?? 0),
+      search: [extId, plan.id, plan.ref, plan.isin, view.folio, view.scheme, view.investor.name, view.investor.pan].filter(Boolean).join(' ').toLowerCase(),
+    };
+  });
+}
+
+/** An instalment of one of these plans, found by its dashboard id. */
+export function findInstallment(plans: UpOrder[], uuid: string): { plan: UpOrder; installment: Record<string, unknown>; index: number } | null {
+  for (const plan of plans) {
+    const list = installmentOrders(plan);
+    const index = list.findIndex((i, n) => uuidFor('order', textOf(i['id']) ?? `${plan.id}#${n}`) === uuid);
+    if (index >= 0) return { plan, installment: list[index]!, index };
+  }
+  return null;
 }
 
 // --- holdings, payments, an investor's money -----------------------------------------------------

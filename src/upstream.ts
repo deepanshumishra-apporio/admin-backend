@@ -169,25 +169,36 @@ function cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<
   return value;
 }
 
+/**
+ * The app keeps a SIP at `awaiting_payment` until its up-front instalment is allotted, a day or two after the investor
+ * paid, although it already reports `first_payment_received`. Once the money is in, the SIP is running: show it active.
+ */
+export function settledPlan(o: UpOrder): UpOrder {
+  return o.state === 'awaiting_payment' && o['first_payment_received'] === true ? { ...o, state: 'active' } : o;
+}
+
 export type Lists = { investors: UpInvestor[]; orders: UpOrder[]; fetchedAt: string };
 
 /** All investors and all orders and plans, as one staff member (or system job) sees them now. */
 export function lists(actor: string, { fresh = false } = {}): Promise<Lists> {
   return cached(`lists:${actor}`, fresh ? 0 : config.listCacheMs, async () => {
     const [investors, orders] = await Promise.all([listAll<UpInvestor>('/investors', actor), listAll<UpOrder>('/orders', actor)]);
-    return { investors, orders, fetchedAt: new Date().toISOString() };
+    return { investors, orders: orders.map(settledPlan), fetchedAt: new Date().toISOString() };
   });
 }
 
 export const investorDetail = (id: string | number, actor: string) =>
-  cached(`investor:${id}:${actor}`, config.listCacheMs, () => upstream<UpDetailResponse>(`/investors/${encodeURIComponent(String(id))}`, actor));
+  cached(`investor:${id}:${actor}`, config.listCacheMs, async () => {
+    const resp = await upstream<UpDetailResponse>(`/investors/${encodeURIComponent(String(id))}`, actor);
+    return { ...resp, sips: (resp.sips ?? []).map(settledPlan) };
+  });
 
 export const portfolio = (id: string | number, actor: string) =>
   cached(`portfolio:${id}:${actor}`, 5 * 60_000, () =>
     upstream<UpPortfolio>(`/investors/${encodeURIComponent(String(id))}/portfolio`, actor, PortfolioTimeoutMs),
   );
 
-export const orderById = (id: string, actor: string) => upstream<UpOrder>(`/orders/${encodeURIComponent(id)}`, actor);
+export const orderById = async (id: string, actor: string) => settledPlan(await upstream<UpOrder>(`/orders/${encodeURIComponent(id)}`, actor));
 
 /** Runs `fn` over `items`, at most `limit` at a time. */
 export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {

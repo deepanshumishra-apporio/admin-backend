@@ -1,19 +1,34 @@
-// Transaction monitoring: every one-time order across investors, with the flags that need a look.
+// Transaction monitoring: every order across investors (one-time orders and SIP/SWP/STP instalments), with the flags
+// that need a look.
 import { actorOf, audit, authenticate, need } from '../auth.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Router } from '../http.ts';
 import { snapshot, type Snapshot } from '../investors.ts';
-import { FlagLabels, failureReason, inFlight, isOrder, istDate, ms, MonitorStates, OrderFlags, OrderTypes, toMonitored } from '../map.ts';
-import { extIdOf, uuidFor } from '../security.ts';
+import {
+  FlagLabels,
+  isOrder,
+  isPlan,
+  istDate,
+  ms,
+  monitorInstallments,
+  monitorOrder,
+  MonitorStates,
+  OrderFlags,
+  OrderTypes,
+  toMonitored,
+  type MonitorRow,
+} from '../map.ts';
+import { extIdOf } from '../security.ts';
 import { orderById } from '../upstream.ts';
 
 const DayMs = 86_400_000;
-const TypeKind: Record<string, string> = { PURCHASE: 'purchase', REDEMPTION: 'redemption', SWITCH: 'switch' };
+const Terminal = new Set(['SUCCESSFUL', 'FAILED', 'CANCELLED', 'REVERSED']);
 
-function monitored(snap: Snapshot) {
-  return snap.orders
-    .filter(isOrder)
-    .map((o) => ({ up: o, view: toMonitored(o, snap.byExtId.get(String(o.user_id))) }))
-    .sort((a, b) => b.view.placedAt.localeCompare(a.view.placedAt));
+function monitored(snap: Snapshot): MonitorRow[] {
+  const facts = (userId: number) => snap.byExtId.get(String(userId));
+  return [
+    ...snap.orders.filter(isOrder).map((o) => monitorOrder(o, facts(o.user_id))),
+    ...snap.orders.filter(isPlan).flatMap((p) => monitorInstallments(p, facts(p.user_id))),
+  ].sort((a, b) => b.placedMs - a.placedMs);
 }
 
 export function transactionRoutes(router: Router): void {
@@ -23,30 +38,30 @@ export function transactionRoutes(router: Router): void {
   router.get('/transactions/summary', full, read, async (ctx) => {
     const rows = monitored(await snapshot(ctx));
     const today = istDate(Date.now());
-    const on = (value: string | null | undefined, day: string) => !!value && istDate(ms(value)) === day;
-    const placedToday = rows.filter((r) => on(r.up.created_at, today));
+    const on = (at: number, day: string) => at > 0 && istDate(at) === day;
+    const placedToday = rows.filter((r) => on(r.placedMs, today));
     const flags = new Map<string, number>();
     for (const r of rows) if (r.view.flag) flags.set(r.view.flag, (flags.get(r.view.flag) ?? 0) + 1);
     const paymentsToday = new Map<number, { status: string; amount: number }>();
     for (const r of rows) {
-      const p = r.up.payment;
-      if (!p || !on(r.up.updated_at, today)) continue;
+      const p = r.payment;
+      if (!p || !on(r.updatedMs, today)) continue;
       const entry = paymentsToday.get(p.id) ?? { status: p.status, amount: 0 };
-      entry.amount += Number(r.up.amount ?? 0);
+      entry.amount += r.amount;
       paymentsToday.set(p.id, entry);
     }
     const payments = [...paymentsToday.values()];
     const failures = new Map<string, number>();
     for (const r of rows) {
-      if (r.up.state !== 'failed') continue;
-      const reason = failureReason(r.up) ?? 'No reason given';
+      if (r.view.state !== 'FAILED') continue;
+      const reason = r.view.failureReason ?? 'No reason given';
       failures.set(reason, (failures.get(reason) ?? 0) + 1);
     }
     const daily = Array.from({ length: 14 }, (_, i) => istDate(Date.now() - (13 - i) * DayMs)).map((date) => ({
       date,
-      placed: rows.filter((r) => on(r.up.created_at, date)).length,
-      successful: rows.filter((r) => r.up.state === 'successful' && on(r.up.succeeded_at ?? r.up.updated_at, date)).length,
-      failed: rows.filter((r) => r.up.state === 'failed' && on(r.up.updated_at, date)).length,
+      placed: rows.filter((r) => on(r.placedMs, date)).length,
+      successful: rows.filter((r) => r.view.state === 'SUCCESSFUL' && on(ms(r.view.completedAt) || r.updatedMs, date)).length,
+      failed: rows.filter((r) => r.view.state === 'FAILED' && on(r.updatedMs, date)).length,
     }));
     return {
       generatedAt: new Date().toISOString(),
@@ -54,10 +69,10 @@ export function transactionRoutes(router: Router): void {
         placed: placedToday.length,
         successful: daily.at(-1)!.successful,
         failed: daily.at(-1)!.failed,
-        purchaseAmount: placedToday.filter((r) => r.up.kind === 'purchase').reduce((s, r) => s + Number(r.up.amount ?? 0), 0).toFixed(2),
-        redemptionAmount: placedToday.filter((r) => r.up.kind === 'redemption').reduce((s, r) => s + Number(r.up.amount ?? 0), 0).toFixed(2),
+        purchaseAmount: placedToday.filter((r) => r.view.kind === 'purchase').reduce((s, r) => s + r.amount, 0).toFixed(2),
+        redemptionAmount: placedToday.filter((r) => r.view.kind === 'redemption').reduce((s, r) => s + r.amount, 0).toFixed(2),
       },
-      inFlight: rows.filter((r) => inFlight(r.up)).length,
+      inFlight: rows.filter((r) => !Terminal.has(r.view.state)).length,
       attention: OrderFlags.map((key) => ({ key, label: FlagLabels[key], count: flags.get(key) ?? 0 })),
       paymentsToday: {
         successful: payments.filter((p) => p.status === 'SUCCESS').length,
@@ -79,18 +94,15 @@ export function transactionRoutes(router: Router): void {
     const from = q.get('from');
     const to = q.get('to');
     const search = q.get('search')?.trim().toLowerCase();
-    const rows = monitored(await snapshot(ctx)).filter(({ up, view }) => {
-      if (types.length && !types.some((t) => TypeKind[t] === up.kind)) return false;
+    const rows = monitored(await snapshot(ctx)).filter(({ view, placedMs, search: hay }) => {
+      if (types.length && !types.includes(view.type)) return false;
       if (states.length && !states.includes(view.state)) return false;
       if (flags.length && (!view.flag || !flags.includes(view.flag))) return false;
       if (attention && !view.flag) return false;
-      const day = istDate(ms(up.created_at));
+      const day = istDate(placedMs);
       if (from && day < from) return false;
       if (to && day > to) return false;
-      if (search) {
-        const hay = [up.ref, up.id, up.isin, up.folio, view.scheme, view.investor.name, view.investor.pan].filter(Boolean).join(' ').toLowerCase();
-        if (!hay.includes(search)) return false;
-      }
+      if (search && !hay.includes(search)) return false;
       return true;
     });
     const { offset, limit } = pageParams(q);
@@ -100,24 +112,25 @@ export function transactionRoutes(router: Router): void {
 
   router.get('/transactions/:orderId', full, read, async (ctx) => {
     const id = uuidParam(ctx, 'orderId');
-    const snap = await snapshot(ctx);
-    const found = snap.orders.find((o) => isOrder(o) && uuidFor('order', o.id) === id);
+    const found = monitored(await snapshot(ctx)).find((r) => r.view.id === id);
     if (!found) throw HttpError.notFound('That order could not be found.');
-    return toMonitored(found, snap.byExtId.get(String(found.user_id)));
+    return found.view;
   });
 
-  // The app backend is the only one that talks to FP, so "refresh" re-reads the order from it.
+  // The app backend is the only one that talks to FP, so "refresh" re-reads the order from it. An instalment has no
+  // order of its own at the app backend: its plan is re-read instead, and the instalment picked out of it.
   router.post('/transactions/:orderId/refresh', full, read, async (ctx) => {
     const id = uuidParam(ctx, 'orderId');
-    let extId = await extIdOf('order', id);
-    if (!extId) {
-      const snap = await snapshot(ctx);
-      extId = snap.orders.find((o) => uuidFor('order', o.id) === id)?.id ?? null;
-    }
+    const known = monitored(await snapshot(ctx)).find((r) => r.view.id === id);
+    const extId = known?.refreshId ?? (await extIdOf('order', id));
     if (!extId) throw HttpError.notFound('That order could not be found.');
     const fresh = await orderById(extId, actorOf(ctx));
     const snap = await snapshot(ctx, { fresh: true });
     await audit(ctx, 'transaction.refreshed', extId);
-    return toMonitored(fresh, snap.byExtId.get(String(fresh.user_id)));
+    const facts = snap.byExtId.get(String(fresh.user_id));
+    if (!isPlan(fresh)) return toMonitored(fresh, facts);
+    const row = monitorInstallments(fresh, facts).find((r) => r.view.id === id);
+    if (!row) throw HttpError.notFound('That instalment could not be found.');
+    return row.view;
   });
 }
