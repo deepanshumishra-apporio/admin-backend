@@ -59,6 +59,13 @@ export type UpOrder = {
   amount: number | null;
   units: number | null;
   units_in?: number | null;
+  /** True when the investor redeemed or switched their whole holding; amount is null then. */
+  all_units?: boolean;
+  /** Open all-units orders only: units held × latest NAV. */
+  estimated_amount?: number | null;
+  /** What the fund house actually processed (a purchase is net of stamp duty). Null until allotted. */
+  processed_amount?: number | null;
+  processed_units?: number | null;
   nav: number | null;
   state: string;
   status?: string | null;
