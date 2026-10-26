@@ -169,12 +169,32 @@ function cached<T>(key: string, ttlMs: number, load: () => Promise<T>): Promise<
   return value;
 }
 
+/** FP purchase states an order only reaches once its money is in. FP never moves an order back out of them. */
+const PaidStates = new Set(['confirmed', 'submitted', 'successful', 'reversed']);
+
+/**
+ * Whether a SIP's up-front first payment came through, or null when the SIP had none. The instalment's own FP state
+ * decides, because it only moves forward; the app's first_payment_received and first_payment_failed flags are not
+ * stable (first_payment_received is cleared again once the instalment is allotted), so they only fill in while the
+ * instalment still reads pending.
+ */
+export function firstPayment(plan: UpOrder): 'SUCCESS' | 'FAILED' | 'PENDING' | null {
+  const received = plan['first_payment_received'] === true;
+  const failed = plan['first_payment_failed'] === true;
+  const upfront = plan.installments?.find((i) => i['upfront'] === true);
+  if (!upfront) return received ? 'SUCCESS' : failed ? 'FAILED' : null;
+  const state = String(upfront['state'] ?? '').toLowerCase();
+  if (PaidStates.has(state) || received) return 'SUCCESS';
+  if (failed || state === 'failed' || state === 'cancelled') return 'FAILED';
+  return 'PENDING';
+}
+
 /**
  * The app keeps a SIP at `awaiting_payment` until its up-front instalment is allotted, a day or two after the investor
- * paid, although it already reports `first_payment_received`. Once the money is in, the SIP is running: show it active.
+ * paid. Once the money is in, the SIP is running: show it active.
  */
 export function settledPlan(o: UpOrder): UpOrder {
-  return o.state === 'awaiting_payment' && o['first_payment_received'] === true ? { ...o, state: 'active' } : o;
+  return o.state === 'awaiting_payment' && firstPayment(o) === 'SUCCESS' ? { ...o, state: 'active' } : o;
 }
 
 export type Lists = { investors: UpInvestor[]; orders: UpOrder[]; fetchedAt: string };
