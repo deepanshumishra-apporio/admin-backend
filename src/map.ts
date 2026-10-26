@@ -476,7 +476,10 @@ export function monitorInstallments(plan: UpOrder, f: Facts | undefined, now = D
     const scheduled = textOf(i['scheduled_on']);
     const placedMs = ms(i['created_at']) || (upfront ? ms(plan.created_at) : 0) || (scheduled ? Date.parse(`${scheduled}T00:00:00+05:30`) : ms(plan.created_at));
     const updatedMs = Math.max(placedMs, ...['submitted_at', 'confirmed_at', 'succeeded_at', 'failed_at', 'traded_on'].map((k) => ms(i[k])));
-    const paymentStatus = !upfront ? null : plan['first_payment_failed'] === true ? 'FAILED' : plan['first_payment_received'] === true ? 'SUCCESS' : 'PENDING';
+    // The app clears first_payment_received once the instalment is allotted, so an instalment that got past payment
+    // counts as paid whatever the flag says.
+    const paidOn = ['confirmed', 'submitted', 'successful'].includes(state) || plan['first_payment_received'] === true;
+    const paymentStatus = !upfront ? null : plan['first_payment_failed'] === true ? 'FAILED' : paidOn ? 'SUCCESS' : 'PENDING';
     const kind = InstallmentKinds[planKind];
     const amount = money(i['amount'] ?? plan.amount);
     const done = state === 'successful';
