@@ -14,6 +14,7 @@ export const Permissions = [
   { key: 'announcements.manage', description: 'Write announcements and approve colleagues’ ones.' },
   { key: 'portfolios.manage', description: 'Curate model portfolios.' },
   { key: 'meetings.manage', description: 'Record review meetings with investors.' },
+  { key: 'hufs.manage', description: 'Onboard HUFs on NSE: prepare them, get the karta’s consent, approve a colleague’s.' },
   { key: 'staff.manage', description: 'Create staff accounts, reset passwords and 2FA, suspend people.' },
   { key: 'roles.manage', description: 'Create and change roles and what they allow.' },
 ] as const;
@@ -27,7 +28,7 @@ export const SystemRoles: { key: string; name: string; description: string; perm
     key: 'OPERATIONS',
     name: 'Operations',
     description: 'Investors, transactions, reports and compliance.',
-    permissions: ['dashboard.read', 'investors.read', 'transactions.read', 'reports.read', 'compliance.manage'],
+    permissions: ['dashboard.read', 'investors.read', 'transactions.read', 'reports.read', 'compliance.manage', 'hufs.manage'],
   },
   { key: 'SUPPORT', name: 'Support', description: 'Tickets and chats, with read access to investors.', permissions: ['investors.read', 'support.manage', 'transactions.read'] },
   { key: 'COMPLIANCE', name: 'Compliance', description: 'Compliance alerts and reports.', permissions: ['dashboard.read', 'investors.read', 'compliance.manage', 'reports.read', 'transactions.read'] },

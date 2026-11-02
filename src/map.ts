@@ -2,7 +2,10 @@
 // Money and units go out as decimal strings, dates as ISO strings, ids as the UUIDs from `uuidFor`.
 import { config } from './config.ts';
 import { uuidFor } from './security.ts';
-import { firstPayment, type Lists, type UpDetailResponse, type UpFund, type UpHolding, type UpInvestor, type UpOrder, type UpPortfolio } from './upstream.ts';
+import {
+  firstPayment,
+  type Lists, type UpDetailResponse, type UpFatcaStatus, type UpFund, type UpHolding, type UpInvestor, type UpInvestorDetail, type UpOrder, type UpPortfolio,
+} from './upstream.ts';
 
 // --- vocabularies ------------------------------------------------------------------------------
 
@@ -12,6 +15,9 @@ export const JourneyStages = ['SIGNED_UP', 'KYC', 'KYC_COMPLETED', 'PROFILE', 'A
 export type JourneyStage = (typeof JourneyStages)[number];
 export type KycNextStep = 'PROVIDE_DETAILS' | 'FETCH_PROOF' | 'UPLOAD_SIGNATURE' | 'ESIGN' | 'WAITING_ON_PROVIDER';
 export const KycNextSteps: KycNextStep[] = ['PROVIDE_DETAILS', 'FETCH_PROOF', 'UPLOAD_SIGNATURE', 'ESIGN', 'WAITING_ON_PROVIDER'];
+export const AccountTypes = ['INDIVIDUAL', 'HUF'] as const;
+export type AccountType = (typeof AccountTypes)[number];
+export const AccountTypeLabels: Record<AccountType, string> = { INDIVIDUAL: 'Individual', HUF: 'HUF' };
 
 export const KycStatusLabels: Record<KycStatus, string> = {
   NOT_STARTED: 'Not started',
@@ -55,6 +61,13 @@ const StepStage: Record<string, JourneyStage> = {
   'signature-consent': 'ACCOUNT_SETUP',
   nominee: 'ACCOUNT_SETUP',
   esign: 'ACCOUNT_SETUP',
+  // A HUF, added from the karta's login: HUF PAN and KRA check, details, bank, NSE registration (UCC, FATCA, eLog),
+  // then the karta's authorisation link.
+  'huf-pan': 'KYC',
+  'huf-details': 'PROFILE',
+  'huf-bank': 'ACCOUNT_SETUP',
+  'huf-nse': 'ACCOUNT_SETUP',
+  'huf-authorise': 'ACCOUNT_SETUP',
 };
 
 export const KycStalledHours = 72;
@@ -233,6 +246,7 @@ export function planInstallments(p: UpOrder) {
 export type Facts = {
   up: UpInvestor;
   id: string;
+  accountType: AccountType;
   stage: JourneyStage;
   status: string;
   kycStatus: KycStatus;
@@ -262,6 +276,8 @@ function stageOf(up: UpInvestor, invested: boolean): JourneyStage {
   if (up.onboarded_at || up.stage === 'active') return invested ? 'INVESTED' : 'READY_TO_INVEST';
   return StepStage[up.stage] ?? (up.kyc_compliant ? 'PROFILE' : 'SIGNED_UP');
 }
+
+export const accountTypeOf = (up: UpInvestor): AccountType => (up.account_type === 'huf' ? 'HUF' : 'INDIVIDUAL');
 
 const statusOf = (up: UpInvestor): string =>
   up.stage === 'deletion_requested' ? 'DELETION_REQUESTED' : up.stage === 'deleted' ? 'DELETED' : 'ACTIVE';
@@ -295,6 +311,7 @@ export function factsFor(up: UpInvestor, all: UpOrder[], values: Map<number, num
   return {
     up,
     id: uuidFor('investor', up.id),
+    accountType: accountTypeOf(up),
     stage: stageOf(up, invested),
     status: statusOf(up),
     kycStatus,
@@ -331,6 +348,7 @@ export function listItem(f: Facts) {
     name: f.up.name,
     email: f.up.email,
     phone: f.up.mobile ?? '',
+    accountType: f.accountType,
     status: f.status,
     pan: f.up.pan_masked,
     stage: f.stage,
@@ -661,8 +679,10 @@ export function investments(userId: number, orders: UpOrder[], plans: UpOrder[],
   };
 }
 
-export function timeline(up: UpInvestor, orders: UpOrder[], plans: UpOrder[]) {
-  const events: { at: string; event: string }[] = [{ at: iso(up.signed_up_at)!, event: 'Signed up' }];
+export function timeline(up: UpInvestorDetail, orders: UpOrder[], plans: UpOrder[]) {
+  const events: { at: string; event: string }[] = [{ at: iso(up.signed_up_at)!, event: accountTypeOf(up) === 'HUF' ? 'HUF added by the karta' : 'Signed up' }];
+  const registered = iso(up.nse?.registered_at);
+  if (registered) events.push({ at: registered, event: `Registered on NSE as ${up.nse!.client_code ?? 'a client'}` });
   if (up.onboarded_at) events.push({ at: iso(up.onboarded_at)!, event: 'Finished onboarding (e-sign consent)' });
   for (const o of orders) {
     const what = `${humanise(o.kind)} ${o.ref ?? ''} · ₹${money0(o.amount)} in ${schemeName(o.fund, o.isin)}`.replace('  ', ' ');
@@ -677,12 +697,50 @@ export function timeline(up: UpInvestor, orders: UpOrder[], plans: UpOrder[]) {
   return events.sort((a, b) => b.at.localeCompare(a.at));
 }
 
+/** HUF only: the family entity, with the karta as a link to their own record. */
+function hufOf(up: UpInvestorDetail) {
+  if (accountTypeOf(up) !== 'HUF') return null;
+  const huf = up.huf;
+  const kartaId = huf?.karta?.id ?? up.karta_id ?? null;
+  return {
+    formedOn: iso(huf?.formed_on ?? up.dob),
+    natureOfBusiness: huf?.nature_of_business ?? null,
+    karta: kartaId === null ? null : { id: uuidFor('investor', kartaId), name: huf?.karta?.name ?? null, pan: huf?.karta?.pan_masked ?? null },
+    coparceners: (huf?.coparceners ?? []).map((c) => ({ name: c.name, relationship: c.relationship, dateOfBirth: iso(c.dob) })),
+  };
+}
+
+const fatcaOf = (s: UpFatcaStatus | undefined) => ({ status: s?.status ?? 'NOT_SENT', remark: s?.remark ?? null });
+
+/** The investor's NSE registration, when the app backend sends it. */
+function nseOf(up: UpInvestorDetail) {
+  const nse = up.nse;
+  if (!nse) return null;
+  return {
+    clientCode: nse.client_code,
+    registeredAt: iso(nse.registered_at),
+    bankStatus: nse.bank_status,
+    bankRemark: nse.bank_remark ?? null,
+    fatca: nse.fatca ? { cams: fatcaOf(nse.fatca.cams), kfin: fatcaOf(nse.fatca.kfin) } : null,
+    authorised: nse.authorised,
+  };
+}
+
+/** A registrar that rejected the FATCA upload, with its remark; null when none has. */
+export function fatcaRejection(up: UpInvestorDetail): { registrar: 'CAMS' | 'KFin'; remark: string | null } | null {
+  const fatca = up.nse?.fatca;
+  if (fatca?.kfin?.status === 'REJECTED') return { registrar: 'KFin', remark: fatca.kfin.remark ?? null };
+  if (fatca?.cams?.status === 'REJECTED') return { registrar: 'CAMS', remark: fatca.cams.remark ?? null };
+  return null;
+}
+
 export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null, values: Map<number, number>) {
   const up = resp.investor;
   const checks = up.checks ?? {};
   const plans = [...(resp.sips ?? []), ...(resp.stps ?? []), ...(resp.swps ?? [])];
   const facts = factsFor(up, [...resp.orders, ...plans], port ? new Map([[up.id, port.summary.current]]) : values, checks);
   const nominee = up.nominee;
+  const huf = facts.accountType === 'HUF';
   return {
     summary: listItem(facts),
     user: {
@@ -707,10 +765,11 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
     profile: {
       id: uuidFor('profile', up.id),
       name: up.name,
-      dateOfBirth: up.dob ?? null,
-      gender: up.gender ?? null,
+      // For a HUF, NSE's date of birth is the date the HUF was formed, and there is no gender.
+      dateOfBirth: huf ? null : up.dob ?? null,
+      gender: huf ? null : up.gender ?? null,
       occupation: up.occupation ?? null,
-      taxStatus: null,
+      taxStatus: huf ? 'HUF' : 'INDIVIDUAL',
       incomeSlab: up.income_slab ?? null,
       addresses: up.address
         ? [{ city: up.address.city ?? null, state: up.address.state ?? null, postalCode: up.address.pincode ?? '', country: 'IN' }]
@@ -730,6 +789,8 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
         }]
       : [],
     nomination: {
+      // A HUF can't nominate (NSE nomination_opt N).
+      notApplicable: huf,
       optedOut: Boolean(up.nominee_opted_out),
       nominees: nominee
         ? [{
@@ -740,6 +801,8 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
         : [],
     },
     mandates: [],
+    huf: hufOf(up),
+    nse: nseOf(up),
     investments: investments(up.id, resp.orders, plans, port),
     timeline: timeline(up, resp.orders, plans),
   };

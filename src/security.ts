@@ -1,7 +1,27 @@
 // Passwords, session tokens, TOTP and the stable UUIDs handed to the dashboard.
-import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 
+import { config } from './config.ts';
 import { one, run } from './db.ts';
+
+// --- data at rest -------------------------------------------------------------------------
+// What a HUF registration needs in full (PANs, bank account, dates of birth, address) is kept with AES-256-GCM
+// under ADMIN_DATA_KEY, so a copy of the database alone doesn't reveal it.
+
+export function seal(value: unknown): string {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', config.dataKey, iv);
+  const body = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
+  return `v1.${iv.toString('base64')}.${cipher.getAuthTag().toString('base64')}.${body.toString('base64')}`;
+}
+
+export function unseal<T>(sealed: string): T {
+  const [version, iv, tag, body] = sealed.split('.');
+  if (version !== 'v1' || !iv || !tag || !body) throw new Error('Unreadable sealed value.');
+  const decipher = createDecipheriv('aes-256-gcm', config.dataKey, Buffer.from(iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(tag, 'base64'));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(body, 'base64')), decipher.final()]).toString('utf8')) as T;
+}
 
 // --- passwords -----------------------------------------------------------------------
 

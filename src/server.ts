@@ -7,6 +7,7 @@ import { closeDb, migrate } from './db.ts';
 import { handle, Router } from './http.ts';
 import { announcementRoutes } from './routes/announcements.ts';
 import { complianceRoutes, startComplianceLoop } from './routes/compliance.ts';
+import { hufRoutes } from './routes/hufs.ts';
 import { investorRoutes } from './routes/investors.ts';
 import { meetingRoutes } from './routes/meetings.ts';
 import { reportRoutes } from './routes/reports.ts';
@@ -33,6 +34,7 @@ complianceRoutes(router);
 supportRoutes(router);
 announcementRoutes(router);
 meetingRoutes(router);
+hufRoutes(router);
 
 const server = createServer((req, res) => void handle(router, '/api/v1/admin', req, res));
 server.listen(config.port, config.host, () => {

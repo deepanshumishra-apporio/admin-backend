@@ -5,14 +5,14 @@ import { config } from '../config.ts';
 import { all, nowIso, one, run, tx } from '../db.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { snapshot, type Snapshot } from '../investors.ts';
-import { flagOf, isOrder, isPlan, ms, money0, supportInvestor, type Facts } from '../map.ts';
+import { fatcaRejection, flagOf, isOrder, isPlan, ms, money0, supportInvestor, type Facts } from '../map.ts';
 import { newId, uuidFor } from '../security.ts';
 import { investorDetail, mapLimit } from '../upstream.ts';
 
 export const Kinds = [
   'KYC_STALLED', 'KYC_FAILED', 'SIP_FAILURES', 'MANDATE_REJECTED', 'MANDATE_PENDING', 'PAID_NOT_ALLOTTED', 'ORDER_STUCK', 'NOMINEE_MISSING',
   'REDEMPTION_PAYOUT_PENDING', 'REFUND_PENDING', 'CONSENT_MISSING', 'KYC_NOT_COMPLIANT', 'PEP_INVESTOR', 'LARGE_TRANSACTION', 'RAPID_ROUND_TRIP',
-  'COMPLAINT_OVERDUE', 'PAYOUT_BANK_UNVERIFIED', 'CONTACT_MISSING', 'MONITORING_STALE',
+  'COMPLAINT_OVERDUE', 'PAYOUT_BANK_UNVERIFIED', 'CONTACT_MISSING', 'MONITORING_STALE', 'FATCA_REJECTED',
 ] as const;
 type Kind = (typeof Kinds)[number];
 const Severities = ['HIGH', 'MEDIUM', 'LOW'] as const;
@@ -38,6 +38,7 @@ export const KindLabels: Record<Kind, string> = {
   PAYOUT_BANK_UNVERIFIED: 'Payout bank not verified',
   CONTACT_MISSING: 'Contact details missing',
   MONITORING_STALE: 'Monitoring data stale',
+  FATCA_REJECTED: 'FATCA rejected by the registrar',
 };
 
 type Detection = {
@@ -55,7 +56,7 @@ const DayMs = 24 * HourMs;
 const LargeAmount = Number(process.env['LARGE_TRANSACTION_AMOUNT'] ?? 500_000);
 /** Checks that need each investor's full record run at most this often on the timer (always on "Run checks now"). */
 const DeepEveryMs = 6 * HourMs;
-const DeepKinds = new Set<Kind>(['KYC_FAILED', 'NOMINEE_MISSING', 'PAYOUT_BANK_UNVERIFIED', 'COMPLAINT_OVERDUE']);
+const DeepKinds = new Set<Kind>(['KYC_FAILED', 'NOMINEE_MISSING', 'PAYOUT_BANK_UNVERIFIED', 'COMPLAINT_OVERDUE', 'FATCA_REJECTED']);
 const SystemActor = 'system:compliance-scan';
 
 const scheme = (o: { fund?: { name: string } | null; isin: string }) => o.fund?.name ?? o.isin;
@@ -133,7 +134,9 @@ async function deepDetections(snap: Snapshot): Promise<Detection[]> {
     found.push({ kind: 'COMPLAINT_OVERDUE', severity: 'MEDIUM', dedupeKey: `ticket_overdue:${t.id}`, userExtId: t.user_ext_id,
       entity: { type: 'ticket', id: t.id }, title: `Ticket TKT-${String(t.seq).padStart(5, '0')} past its SLA`, detail: `"${t.subject}" was due ${t.sla_due_at}.` });
   }
-  const targets = snap.facts.filter((f) => f.up.onboarded_at || (!f.up.kyc_compliant && ['pan', 'pan-confirm'].includes(f.up.stage)));
+  // HUFs are few and their NSE registration (FATCA, bank) can fail before onboarding finishes, so all of them are read.
+  const targets = snap.facts.filter((f) => f.up.onboarded_at || f.accountType === 'HUF' ||
+    (!f.up.kyc_compliant && ['pan', 'pan-confirm'].includes(f.up.stage)));
   await mapLimit(targets, 3, async (f) => {
     const userExtId = String(f.up.id);
     const resp = await investorDetail(f.up.id, SystemActor).catch(() => null);
@@ -144,13 +147,27 @@ async function deepDetections(snap: Snapshot): Promise<Detection[]> {
       found.push({ kind: 'KYC_FAILED', severity: 'HIGH', dedupeKey: `kyc_failed:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
         title: 'PAN check not passed', detail: `The KRA check for this PAN came back "${readiness}". The investor cannot onboard until it is fixed.` });
     }
-    if (d.onboarded_at && !d.nominee && !d.nominee_opted_out) {
+    // A HUF can't nominate, so it never needs a nominee or an opt-out.
+    if (d.onboarded_at && f.accountType !== 'HUF' && !d.nominee && !d.nominee_opted_out) {
       found.push({ kind: 'NOMINEE_MISSING', severity: 'LOW', dedupeKey: `nominee_missing:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
         title: 'No nominee and no opt-out', detail: 'SEBI requires a nomination or an explicit opt-out for every folio.' });
     }
-    if (d.onboarded_at && d.bank && !d.bank.verified) {
+    const nseBank = d.nse?.bank_status?.toUpperCase();
+    if (nseBank && nseBank !== 'ACTIVE' && nseBank !== 'PENDING') {
+      const holder = f.accountType === 'HUF' ? " The account must be the HUF's own, in the HUF's name." : '';
+      found.push({ kind: 'PAYOUT_BANK_UNVERIFIED', severity: 'HIGH', dedupeKey: `bank_unverified:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
+        title: 'NSE rejected the bank account',
+        detail: `NSE's bank check came back "${d.nse!.bank_status}"${d.nse!.bank_remark ? `: ${d.nse!.bank_remark}` : ''}.${holder} Fix it with a UCC modification.` });
+    } else if (d.onboarded_at && d.bank && !d.bank.verified) {
       found.push({ kind: 'PAYOUT_BANK_UNVERIFIED', severity: 'MEDIUM', dedupeKey: `bank_unverified:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
         title: 'Payout bank account not verified', detail: `Redemptions pay out to ${d.bank.bank_name ?? 'a bank'} ${d.bank.account_masked}, which is not verified.` });
+    }
+    const fatca = fatcaRejection(d);
+    if (fatca) {
+      const ubo = f.accountType === 'HUF' && /UBO/i.test(fatca.remark ?? '') ? ' For a HUF, re-send FATCA with the karta as beneficial owner (ubo_appl Y).' : '';
+      found.push({ kind: 'FATCA_REJECTED', severity: 'HIGH', dedupeKey: `fatca_rejected:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
+        title: `${fatca.registrar} rejected the FATCA declaration`,
+        detail: `${fatca.registrar} rejected FATCA for ${d.nse?.client_code ?? 'this investor'}${fatca.remark ? `: "${fatca.remark}"` : ''}. Allotments in its funds can be held up until it is fixed.${ubo}` });
     }
   });
   return found;

@@ -58,6 +58,62 @@ a UUID derived from its kind and id (`uuidFor`), remembered in `id_map` so it ca
 | Announcements reaching the app (banner, notification, seen/tap counts) | the app backend must read them from here. Writing and approving works; delivery counts stay 0 |
 | Last login / KYC forms / consent / gateway on records | not in the Admin API; shown as empty |
 | Sign-ups over time, AUM total | computed by paging every investor; fine now, slow at thousands. A `/summary` field would help |
+| HUFs (see below) | no account type, HUF or NSE fields yet. Until they arrive every investor shows as an individual |
+
+### HUFs: the fields this server reads
+
+A HUF is its own investor: the karta adds it from their login, and it is registered on NSE Invest under the HUF PAN
+(tax status `03`, client codes `RSPH…`; see the NSE repo's `sip-flow/HUF-FLOW.md`). Every field is optional, so an
+Admin API without them still works. Types: `UpInvestor`, `UpHuf`, `UpNse` in [src/upstream.ts](src/upstream.ts).
+
+| Where | Field | Used for |
+|---|---|---|
+| `GET /investors` and `/investors/:id` | `account_type`: `individual` \| `huf` | HUF badge, list filter (`accountType=HUF`), funnel split, exports |
+| same | `karta_id` | Link from the HUF to the karta's record |
+| same | `stage` values `huf-pan`, `huf-details`, `huf-bank`, `huf-nse`, `huf-authorise` | Journey stages: KYC, Profile, then Account setup |
+| `GET /investors/:id` | `huf`: `formed_on`, `nature_of_business`, `karta { id, name, pan_masked }`, `coparceners [{ name, relationship, dob }]` | The record's "HUF & NSE" tab |
+| same | `nse`: `client_code`, `registered_at`, `bank_status`, `bank_remark`, `authorised` | NSE registration on the record; `bank_status` other than `PENDING`/`ACTIVE` raises `PAYOUT_BANK_UNVERIFIED` (high) |
+| same | `nse.fatca`: `{ cams, kfin }`, each `{ status: NOT_SENT \| PENDING \| ACCEPTED \| REJECTED, remark }`, from NSE's `FATCA_REPORT` | `FATCA_REJECTED` alert (e.g. KFin's "MISSING/INVALID UBO_EXCH" for a HUF sent without the karta as UBO) |
+
+HUFs are never flagged `NOMINEE_MISSING` (a HUF can't nominate), and every HUF is read by the 6-hourly deep check
+because its NSE registration can fail before onboarding finishes. Send `authorised: null` when NSE's
+`CLIENT_AUTHORIZATION` report is empty: it is empty for HUFs even once they are active.
+
+## Onboarding HUFs on NSE (the one thing this server writes outside itself)
+
+Staff onboard a Hindu Undivided Family on NSE Invest from **Onboarding → HUFs** in the dashboard. It is the only place
+this server writes to another system, so it is fenced: UAT by default, the live account only with `NSE_ALLOW_PROD=true`,
+a second person approves, and the karta consents on their own device first.
+
+```
+Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ duplicate check ─▶ UCC ─▶ FATCA ─▶ waiting on karta ─▶ active
+ (staff)   (staff sends it)   (public page,      (not the preparer)     (client_master    (CLIENT   (FATCA_COMMON,  (NSE bank check,
+                              their IP + time)                           by PAN)          COMMON)   karta as UBO)   CL_ACT link + OTP)
+```
+
+- **Code**: [src/routes/hufs.ts](src/routes/hufs.ts) (the steps and states), [src/nse/huf.ts](src/nse/huf.ts) (rules and
+  request bodies), [src/nse/client.ts](src/nse/client.ts) (NSE's authentication: TLS 1.3, browser-like headers, never
+  through `HTTPS_PROXY`). Ported from the NSE `sip-flow` project, whose `HUF-FLOW.md` explains every value.
+- **Data**: table `hufs`. The full details (PANs, bank account, dates of birth, address) are sealed with AES-256-GCM
+  under `ADMIN_DATA_KEY`; only the HUF name, karta name, client code and a masked PAN are in the clear.
+- **Consent**: `POST /hufs/:id/consent-link` returns a one-time token (only its hash is kept, valid 7 days). The
+  karta opens `/huf-consent/<token>` on the dashboard, sees the details masked, and agrees. Their IP and time are
+  recorded and sent to NSE in FATCA's `log_name`. Editing the HUF afterwards clears the consent. In production a
+  loopback or private IP is refused, so a missing `TRUST_PROXY` can never put our own address on record.
+- **Retries**: approving again after a failure re-runs only the NSE steps that did not finish; the UCC is never
+  re-sent. Once the UCC is in, the details are locked (a change would need a UCC modification, not built yet).
+- **Active**: NSE's authorisation report is empty for HUFs, so staff mark a HUF active once an order is accepted.
+- **No eLog**: NSE's ELOG API is for individuals only.
+- **Tested**: `test/hufs.test.ts` against a fake NSE; and end to end on NSE UAT on 2 Nov 2026 through the dashboard
+  (UCC and FATCA with the karta as UBO accepted, client `HUFT582104`). Not yet proven: KFin accepting that FATCA
+  (UAT never forwards it), and the `ubo_code` (`NSE_HUF_UBO_CODE`, default `C01`).
+
+To switch it on for a server: set `ADMIN_DATA_KEY` and the `NSE_*` values (see `.env.example`), ask NSE to whitelist
+the server's IP for UAT, and give **HUF onboarding on NSE** to the roles that need it (Operations has it by default on
+a new database; on an existing one add it in Staff → Roles). For the consent page, set the same random value as
+`DASHBOARD_PROXY_KEY` here and `ADMIN_API_PROXY_KEY` on the dashboard (Vercel): Caddy replaces `X-Forwarded-For` with
+the dashboard server's address, so the dashboard also sends the visitor's IP in `X-RiSips-Client-IP` with that key.
+Without it, a production consent is refused rather than recorded with the wrong IP.
 
 ## Deploying on the AWS admin server
 

@@ -30,6 +30,32 @@ export type UpInvestor = {
   onboarded_at: string | null;
   orders: number;
   plans: number;
+  /** Absent means an individual. A HUF is its own investor, onboarded on NSE under the karta's login. */
+  account_type?: 'individual' | 'huf';
+  /** HUF only: the karta's own investor id. */
+  karta_id?: number | null;
+};
+
+/** One registrar's copy of a FATCA upload, as the app backend reads it from NSE's FATCA_REPORT. */
+export type UpFatcaStatus = { status: 'NOT_SENT' | 'PENDING' | 'ACCEPTED' | 'REJECTED'; remark?: string | null };
+
+/** HUF only: the family entity behind the HUF PAN. */
+export type UpHuf = {
+  formed_on: string | null;
+  nature_of_business?: string | null;
+  karta: { id: number; name: string | null; pan_masked: string | null } | null;
+  coparceners: { name: string; relationship: string; dob?: string | null }[];
+};
+
+/** The investor's registration on NSE Invest (NMF II): UCC, FATCA, bank check and the karta's authorisation. */
+export type UpNse = {
+  client_code: string | null;
+  registered_at?: string | null;
+  bank_status: string | null;
+  bank_remark?: string | null;
+  fatca: { cams: UpFatcaStatus; kfin: UpFatcaStatus } | null;
+  /** True once the investor has opened the CL_ACT link; null when unknown (NSE's report is empty for HUFs). */
+  authorised: boolean | null;
 };
 
 export type UpInvestorDetail = UpInvestor & {
@@ -46,6 +72,8 @@ export type UpInvestorDetail = UpInvestor & {
   nominee_opted_out?: boolean;
   checks?: Record<string, unknown>;
   deletion?: Record<string, unknown> | null;
+  huf?: UpHuf | null;
+  nse?: UpNse | null;
 };
 
 /** An order or a plan (the Admin API lists both under /orders; `kind` tells them apart). */

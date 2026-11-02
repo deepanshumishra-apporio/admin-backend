@@ -8,7 +8,7 @@ process.env['DB_SCHEMA'] = `admin_test_${randomBytes(4).toString('hex')}`;
 
 const { closeDb, migrate, run } = await import('../src/db.ts');
 const { toCsv } = await import('../src/http.ts');
-const { flagOf, iso, factsFor, toMonitored } = await import('../src/map.ts');
+const { flagOf, iso, factsFor, toMonitored, investorDetail, fatcaRejection } = await import('../src/map.ts');
 const { hashPassword, verifyPassword, uuidFor, extIdOf, flushIds, verifyTotp, newTotpSecret, passwordProblem } = await import('../src/security.ts');
 const { seedRoles } = await import('../src/auth.ts');
 
@@ -98,6 +98,34 @@ test('investor facts: stage, KYC and invested amount', () => {
   const view = toMonitored(order({ state: 'successful', succeeded_at: '2026-10-21T14:54:13+05:30' }), facts);
   assert.equal(view.state, 'SUCCESSFUL');
   assert.equal(view.investor.id, uuidFor('investor', 1));
+});
+
+test('a HUF: account type, its onboarding steps, the karta link, no nominee, FATCA rejection', () => {
+  const up = { id: 7, name: 'XYZ HUF', email: 'karta@x.in', mobile: '9', stage: 'huf-nse', kyc_compliant: true, pan_masked: '******234A',
+    signed_up_at: '2026-10-27 07:40:00', onboarded_at: null, orders: 0, plans: 0, account_type: 'huf' as const, karta_id: 3 };
+  const facts = factsFor(up, [], new Map());
+  assert.equal(facts.accountType, 'HUF');
+  assert.equal(facts.stage, 'ACCOUNT_SETUP');
+  assert.equal(factsFor({ ...up, stage: 'huf-pan', kyc_compliant: false }, [], new Map()).stage, 'KYC');
+  assert.equal(factsFor({ ...up, account_type: undefined }, [], new Map()).accountType, 'INDIVIDUAL');
+
+  const investor = {
+    ...up, dob: '2007-01-15', gender: null,
+    huf: { formed_on: '2007-01-15', karta: { id: 3, name: 'Ram Kumar', pan_masked: '******234P' }, coparceners: [{ name: 'Sita', relationship: 'wife' }] },
+    nse: { client_code: 'RSPH000001', registered_at: '2026-10-27 08:41:00', bank_status: 'ACTIVE', authorised: null,
+      fatca: { cams: { status: 'NOT_SENT' as const }, kfin: { status: 'REJECTED' as const, remark: 'MISSING/INVALID UBO_EXCH FOR THIS PAN' } } },
+  };
+  const detail = investorDetail({ investor, orders: [], sips: [], stps: [], swps: [] }, null, new Map());
+  assert.equal(detail.summary.accountType, 'HUF');
+  assert.equal(detail.profile.taxStatus, 'HUF');
+  assert.equal(detail.profile.dateOfBirth, null);
+  assert.equal(detail.nomination.notApplicable, true);
+  assert.deepEqual(detail.huf?.karta, { id: uuidFor('investor', 3), name: 'Ram Kumar', pan: '******234P' });
+  assert.equal(detail.huf?.formedOn, '2007-01-15');
+  assert.equal(detail.nse?.fatca?.kfin.status, 'REJECTED');
+  assert.ok(detail.timeline.some((e) => e.event === 'Registered on NSE as RSPH000001'));
+  assert.deepEqual(fatcaRejection(investor), { registrar: 'KFin', remark: 'MISSING/INVALID UBO_EXCH FOR THIS PAN' });
+  assert.equal(investorDetail({ investor: { ...up, account_type: undefined }, orders: [], sips: [], stps: [], swps: [] }, null, new Map()).huf, null);
 });
 
 test('CSV escapes quotes and neutralises formulas', () => {

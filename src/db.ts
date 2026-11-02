@@ -1,5 +1,6 @@
-// The admin database (PostgreSQL): staff, roles, sessions, audit, tickets, alerts, announcements, meetings.
-// Investor data never lands here. Investors are referenced by the app backend's id (`user_ext_id`) only.
+// The admin database (PostgreSQL): staff, roles, sessions, audit, tickets, alerts, announcements, meetings, and the
+// HUFs staff onboard on NSE. App investors' data never lands here: they are referenced by the app backend's id
+// (`user_ext_id`) only. A HUF's registration details are kept sealed (see `seal` in security.ts).
 // Everything lives in its own schema (DB_SCHEMA, default "admin"), so the database can be shared safely.
 import pg from 'pg';
 
@@ -20,7 +21,7 @@ export type Row = Record<string, unknown>;
 
 const Tables = [
   'roles', 'staff', 'staff_roles', 'sessions', 'login_events', 'audit_log', 'id_map', 'tickets', 'ticket_messages',
-  'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings',
+  'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings', 'hufs', 'huf_events',
 ];
 // Neon's pooled endpoint (PgBouncer) refuses a per-connection search_path, so queries name the schema themselves:
 // a table after FROM / JOIN / INTO / UPDATE is written `schema.table`.
@@ -265,6 +266,40 @@ CREATE TABLE IF NOT EXISTS meetings (
   notes TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS hufs (
+  id TEXT PRIMARY KEY,
+  client_code TEXT NOT NULL UNIQUE,
+  huf_name TEXT NOT NULL,
+  pan_masked TEXT NOT NULL,
+  pan_hash TEXT NOT NULL,
+  karta_name TEXT NOT NULL,
+  details TEXT NOT NULL,
+  status TEXT NOT NULL,
+  consent_token_hash TEXT,
+  consent_expires_at TEXT,
+  consent_ip TEXT,
+  consent_at TEXT,
+  consent_user_agent TEXT,
+  steps TEXT NOT NULL,
+  nse_status TEXT,
+  auth_link TEXT,
+  auth_link_error TEXT,
+  last_error TEXT,
+  created_by TEXT NOT NULL REFERENCES staff(id),
+  approved_by TEXT REFERENCES staff(id),
+  approved_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS hufs_pan ON hufs(pan_hash);
+CREATE TABLE IF NOT EXISTS huf_events (
+  id TEXT PRIMARY KEY,
+  huf_id TEXT NOT NULL REFERENCES hufs(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  staff_id TEXT REFERENCES staff(id),
+  note TEXT,
+  created_at TEXT NOT NULL
 );
 COMMIT;
 `;

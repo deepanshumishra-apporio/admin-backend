@@ -1,5 +1,6 @@
 // A small router on node:http. Responses use the envelope the dashboard expects:
 // success `{ data }`, failure `{ error: { code, message, ...details } }`, 204 for no content.
+import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import { config } from './config.ts';
@@ -41,6 +42,8 @@ export type Ctx = {
   query: URLSearchParams;
   body: any;
   ip: string | null;
+  /** The IP is the visitor's, vouched for by the dashboard with the shared key (see `dashboardProxyKey`). */
+  ipFromDashboard: boolean;
   userAgent: string | null;
   token: string | null;
   sessionId?: string;
@@ -129,6 +132,18 @@ function clientIp(req: IncomingMessage): string | null {
   return remote ?? null;
 }
 
+/** The visitor's IP as the dashboard saw it, when it proves with the shared key that the header is its own. */
+function dashboardIp(req: IncomingMessage): string | null {
+  const key = req.headers['x-risips-proxy-key'];
+  const ip = req.headers['x-risips-client-ip'];
+  if (!config.dashboardProxyKey || typeof key !== 'string' || typeof ip !== 'string') return null;
+  const expected = Buffer.from(config.dashboardProxyKey);
+  const given = Buffer.from(key);
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+  const value = ip.trim();
+  return /^[0-9a-fA-F.:]{2,45}$/.test(value) ? value : null;
+}
+
 function send(res: ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -147,6 +162,7 @@ export async function handle(router: Router, prefix: string, req: IncomingMessag
     if (found === 'method') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Method not allowed.');
 
     const auth = req.headers.authorization;
+    const vouched = dashboardIp(req);
     const ctx: Ctx = {
       req,
       method,
@@ -154,7 +170,8 @@ export async function handle(router: Router, prefix: string, req: IncomingMessag
       params: found.params,
       query: url.searchParams,
       body: await readBody(req),
-      ip: clientIp(req),
+      ip: vouched ?? clientIp(req),
+      ipFromDashboard: vouched !== null,
       userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 400) : null,
       token: auth?.startsWith('Bearer ') ? auth.slice(7).trim() || null : null,
     };

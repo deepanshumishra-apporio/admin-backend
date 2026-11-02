@@ -12,6 +12,7 @@ import {
   JourneyStages,
   KycStatuses,
   KycStatusLabels,
+  AccountTypeLabels,
   money,
   money0,
   ms,
@@ -55,12 +56,12 @@ const Reports: Report[] = [
     statusLabel: 'Stage',
     statuses: JourneyStages.map((s) => ({ value: s, label: StageLabels[s] })),
     columns: [
-      c('name', 'Name'), c('email', 'Email'), c('phone', 'Mobile'), c('pan', 'PAN (masked)'), c('stage', 'Stage'),
+      c('name', 'Name'), c('accountType', 'Account type'), c('email', 'Email'), c('phone', 'Mobile'), c('pan', 'PAN (masked)'), c('stage', 'Stage'),
       c('kycStatus', 'KYC'), c('signedUpAt', 'Signed up', 'datetime'), c('onboardedAt', 'Onboarded', 'datetime'),
       c('investedAmount', 'Invested', 'money'), c('currentValue', 'Current value', 'money'), c('activeSips', 'Active SIPs', 'count'),
     ],
     rows: async (ctx) => (await snapshot(ctx)).facts.map((f) => ({
-      name: f.up.name, email: f.up.email, phone: f.up.mobile, pan: f.up.pan_masked, stage: StageLabels[f.stage],
+      name: f.up.name, accountType: AccountTypeLabels[f.accountType], email: f.up.email, phone: f.up.mobile, pan: f.up.pan_masked, stage: StageLabels[f.stage],
       kycStatus: KycStatusLabels[f.kycStatus], signedUpAt: iso(f.up.signed_up_at), onboardedAt: iso(f.up.onboarded_at),
       investedAmount: money0(f.investedAmount), currentValue: money0(f.currentValue), activeSips: f.activeSips,
       _date: day(f.up.signed_up_at), _status: f.stage,

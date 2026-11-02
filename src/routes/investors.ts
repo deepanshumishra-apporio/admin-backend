@@ -3,6 +3,8 @@ import { actorOf, audit, authenticate, need } from '../auth.ts';
 import { Csv, HttpError, listParam, page, pageParams, toCsv, uuidParam, type Router } from '../http.ts';
 import { investorExtId, snapshot, type Snapshot } from '../investors.ts';
 import {
+  AccountTypeLabels,
+  AccountTypes,
   findInstallment,
   installmentToOrder,
   investorDetail,
@@ -81,12 +83,25 @@ function count<K extends string>(keys: readonly K[], labels: Record<K, string>, 
   return keys.map((key) => ({ key, label: labels[key], count: values.filter((v) => v === key).length }));
 }
 
+/** Each milestone counted on its own, as a count of everyone in `f`. A HUF's KYC is the KRA check on the HUF PAN. */
+function funnelOf(f: Facts[]) {
+  const ready = f.filter((x) => x.stage === 'READY_TO_INVEST' || x.stage === 'INVESTED').length;
+  return [
+    { key: 'SIGNED_UP', label: 'Signed up', count: f.length },
+    { key: 'KYC_STARTED', label: 'Started KYC', count: f.filter((x) => x.kycStatus !== 'NOT_STARTED').length },
+    { key: 'KYC_COMPLETED', label: 'KYC completed', count: f.filter((x) => x.kycStatus === 'COMPLETED').length },
+    { key: 'PROFILE', label: 'Profile created', count: f.filter((x) => ['ACCOUNT_SETUP', 'READY_TO_INVEST', 'INVESTED'].includes(x.stage)).length },
+    { key: 'INVESTMENT_ACCOUNT', label: 'Investment account', count: ready },
+    { key: 'READY_TO_INVEST', label: 'Ready to invest', count: ready },
+    { key: 'INVESTED', label: 'Invested', count: f.filter((x) => x.stage === 'INVESTED').length },
+  ];
+}
+
 function summary(snap: Snapshot) {
   const f = snap.facts;
   const today = istStartOfToday();
   const signups = f.map((x) => ms(x.up.signed_up_at));
   const kycValues = f.map((x) => x.kycStatus);
-  const ready = f.filter((x) => x.stage === 'READY_TO_INVEST' || x.stage === 'INVESTED').length;
   const purchases = snap.orders.filter((o) => o.kind === 'purchase' && o.state === 'successful');
   const activeSips = snap.orders.filter((o) => o.kind === 'sip' && planActive(o));
   const statuses = [...new Set(f.map((x) => x.status))];
@@ -107,15 +122,9 @@ function summary(snap: Snapshot) {
       inProgressByStep: count(KycNextSteps, NextStepLabels, f.map((x) => x.kycNextStep).filter((s): s is NonNullable<typeof s> => !!s)),
     },
     journey: { byStage: count(JourneyStages, StageLabels, f.map((x) => x.stage)) },
-    funnel: [
-      { key: 'SIGNED_UP', label: 'Signed up', count: f.length },
-      { key: 'KYC_STARTED', label: 'Started KYC', count: f.filter((x) => x.kycStatus !== 'NOT_STARTED').length },
-      { key: 'KYC_COMPLETED', label: 'KYC completed', count: kycValues.filter((k) => k === 'COMPLETED').length },
-      { key: 'PROFILE', label: 'Profile created', count: f.filter((x) => ['ACCOUNT_SETUP', 'READY_TO_INVEST', 'INVESTED'].includes(x.stage)).length },
-      { key: 'INVESTMENT_ACCOUNT', label: 'Investment account', count: ready },
-      { key: 'READY_TO_INVEST', label: 'Ready to invest', count: ready },
-      { key: 'INVESTED', label: 'Invested', count: f.filter((x) => x.stage === 'INVESTED').length },
-    ],
+    accountTypes: count(AccountTypes, AccountTypeLabels, f.map((x) => x.accountType)),
+    funnel: funnelOf(f),
+    funnelByAccountType: Object.fromEntries(AccountTypes.map((t) => [t, funnelOf(f.filter((x) => x.accountType === t))])),
     attention: {
       kycStalled: f.filter((x) => x.kycStalled).length,
       kycFailedOrExpired: f.filter((x) => x.kycStatus === 'FAILED' || x.kycStatus === 'EXPIRED').length,
@@ -148,6 +157,7 @@ function filtered(snap: Snapshot, query: URLSearchParams): Facts[] {
   const search = query.get('search')?.trim().toLowerCase();
   const stages = listParam(query, 'stage', JourneyStages);
   const kyc = listParam(query, 'kycStatus', KycStatuses);
+  const types = listParam(query, 'accountType', AccountTypes);
   const stalled = query.get('kycStalled') === 'true';
   const sipDue = query.get('sipDueDays') ? Number(query.get('sipDueDays')) : null;
   const attention = query.get('attention');
@@ -159,6 +169,7 @@ function filtered(snap: Snapshot, query: URLSearchParams): Facts[] {
     }
     if (stages.length && !stages.includes(f.stage)) return false;
     if (kyc.length && !kyc.includes(f.kycStatus)) return false;
+    if (types.length && !types.includes(f.accountType)) return false;
     if (stalled && !f.kycStalled) return false;
     if (dueBy && (!f.nextSipDate || f.nextSipDate > dueBy)) return false;
     if (attention === 'KYC' && f.stage !== 'KYC') return false;
@@ -172,6 +183,7 @@ const ExportColumns = [
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Mobile' },
   { key: 'pan', label: 'PAN (masked)' },
+  { key: 'accountType', label: 'Account type' },
   { key: 'stage', label: 'Stage' },
   { key: 'kycStatus', label: 'KYC' },
   { key: 'investedAmount', label: 'Invested (₹)' },
@@ -223,6 +235,7 @@ export function investorRoutes(router: Router): void {
     return {
       total: f.length,
       byStage,
+      byAccountType: Object.fromEntries(AccountTypes.map((t) => [t, f.filter((x) => x.accountType === t).length])),
       kycPending: f.filter((x) => x.kycStatus !== 'COMPLETED').length,
       kycStalled: f.filter((x) => x.kycStalled).length,
       attention: { KYC: f.filter((x) => x.stage === 'KYC').length, SETUP: f.filter((x) => SetupStages.has(x.stage)).length },
