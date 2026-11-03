@@ -107,6 +107,9 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   cheque (`CANCELCHEQUE`). PDF/JPG/PNG/TIFF up to 3 MB, checked by file signature, sent straight to NSE; only the
   name, size and SHA-256 are kept. CAMS/KFin's AOF verdict comes from `AOF_IMAGE_UPLOAD_REPORT`.
 - **Status job**: every 30 min (`HUF_STATUS_INTERVAL_MS`) HUFs still waiting on NSE are re-read; none waiting, no calls.
+- **Sync from NSE**: HUFs registered on NSE directly (RSPH000001/2 were made on NSE's portal) are found in
+  `client_master_report` (7-day windows, from `HUF_SYNC_FROM`, default 2026-10-01; tax status HUF) and added with
+  `source = 'NSE'`, details from the client master and FATCA_REPORT. Once a day (last 14 days), and on "Sync from NSE".
 - **Active**: NSE's authorisation report is empty for HUFs, so staff mark a HUF active once an order is accepted.
 - **No eLog**: NSE's ELOG API is for individuals only.
 - **Tested**: `test/hufs.test.ts` against a fake NSE; and end to end on NSE UAT on 2 Nov 2026 through the dashboard

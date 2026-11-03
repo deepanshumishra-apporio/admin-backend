@@ -343,6 +343,83 @@ function aofStatus(status: unknown, reason: unknown): RegistrarStatus {
   return { status: verdict, remark: trim(reason) || (verdict === 'PENDING' ? trim(status) : '') || null };
 }
 
+// --- HUFs registered on NSE outside this admin (e.g. on NSE's own portal) --------------------------------------
+
+/** dd-mm-yyyy, as client_master_report wants its window. */
+const reportDate = (d: Date) => d.toISOString().slice(0, 10).split('-').reverse().join('-');
+
+/**
+ * Every HUF client NSE has for this member, created between `from` and `to`. client_master_report allows a window of
+ * 7 days at most, so it is read a week at a time.
+ */
+export async function hufClientsOnNse(from: Date, to: Date): Promise<any[]> {
+  const found: any[] = [];
+  for (let start = new Date(from); start <= to; start = new Date(start.getTime() + 7 * 86_400_000)) {
+    const end = new Date(Math.min(start.getTime() + 6 * 86_400_000, to.getTime()));
+    const body = await nsePost('reports/client_master_report', { from_date: reportDate(start), to_date: reportDate(end) });
+    found.push(...rows(body).filter((r) => /^(HUF|03)$/i.test(trim(r.tax_status))));
+  }
+  return [...new Map(found.map((r) => [up(r.client_code), r])).values()];
+}
+
+/** FATCA_REPORT rows for up to 50 PANs at a time, newest first. */
+export async function fatcaRowsFor(pans: string[]): Promise<any[]> {
+  const out: any[] = [];
+  for (let i = 0; i < pans.length; i += 50) {
+    const body = await nsePost('reports/FATCA_REPORT', { pan_pkern_no: pans.slice(i, i + 50).join(','), from_date: '', to_date: '' });
+    out.push(...rows(body));
+  }
+  return out.sort((x, y) => fatcaTime(y.createddatetime) - fatcaTime(x.createddatetime));
+}
+
+/** "Maharashtra" or "MA" -> MA. The client master report gives the state's name. */
+function uccState(value: unknown): string {
+  const v = up(value);
+  if (UccStates[v]) return v;
+  const byName = Object.entries(UccStates).find(([, s]) => up(s.name) === v || (v === 'UTTARANCHAL' && s.name === 'Uttarakhand'));
+  return byName?.[0] ?? v;
+}
+
+/**
+ * A HUF's details as NSE holds them. The karta is known only when FATCA was sent with them as beneficial owner;
+ * the co-parceners never reach NSE. Missing pieces stay blank.
+ */
+export function detailsFromNse(m: any, fatca: any | null): HufDetails {
+  const isoFrom = (v: unknown) => isoDate(trim(v).slice(0, 10));
+  const name = [m.primary_holder_first_name, m.primary_holder_middle_name, m.primary_holder_last_name].map(trim).filter(Boolean).join(' ');
+  return {
+    clientCode: up(m.client_code),
+    hufName: up(name),
+    pan: up(m.primary_holder_pan),
+    formedOn: isoFrom(m.primary_holder_dob_incorporation),
+    placeOfFormation: up(fatca?.po_bir_inc),
+    natureOfBusiness: up(fatca?.nature_bus),
+    incomeSlab: trim(fatca?.inc_slab),
+    netWorthLakhs: trim(fatca?.net_worth),
+    netWorthDate: isoFrom(fatca?.nw_date),
+    email: trim(m.email).toLowerCase(),
+    mobile: trim(m.indian_mobile_no),
+    accountType: trim(m.account_type_1) === 'CB' ? 'CB' : 'SB',
+    accountNo: trim(m.account_no_1),
+    ifsc: up(m.ifsc_code_1),
+    bankHolderName: up(m.cheque_name) || up(name),
+    address1: up(m.address_1), address2: up(m.address_2), address3: up(m.address_3),
+    city: up(m.city), state: uccState(m.state), pincode: trim(m.pincode),
+    karta: {
+      name: up(fatca?.ubo_name), pan: up(fatca?.ubo_pan),
+      dateOfBirth: isoFrom(fatca?.ubo_dob), gender: (['M', 'F', 'O'].includes(up(fatca?.ubo_gender)) ? up(fatca?.ubo_gender) : '') as 'M',
+      fatherName: up(fatca?.ubo_fr_nam),
+    },
+    coparceners: [],
+  };
+}
+
+/** "27/10/2026 02:11:33 PM" -> ISO, for when NSE created the client. */
+export function nseCreatedAt(value: unknown): string | null {
+  const t = fatcaTime(value);
+  return t ? new Date(t - 5.5 * 3_600_000).toISOString() : null;
+}
+
 // --- documents -------------------------------------------------------------------------------
 // Scans of signed paper, sent to NSE as base64. NSE accepts jpg, jpeg, png, tif, tiff and pdf.
 // The AOF matters most: for a non-demat order NSE checks an eLog, AOF or FATCA is on file, and a HUF can't have an

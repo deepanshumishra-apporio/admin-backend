@@ -82,6 +82,8 @@ export const config = {
   hufSecondApprover: env('HUF_SECOND_APPROVER', 'true') !== 'false',
   /** How often HUFs still waiting on NSE (bank check, registrars, the karta) are re-read. */
   hufStatusIntervalMs: Number(env('HUF_STATUS_INTERVAL_MS', String(30 * 60_000))),
+  /** The first sync of HUFs registered on NSE directly reads NSE's client master from this date (yyyy-mm-dd). */
+  hufSyncFrom: env('HUF_SYNC_FROM', '2026-10-01'),
   /**
    * 32 bytes, base64: encrypts what a HUF registration needs in full (PANs, bank account, dates of birth, address).
    * Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"

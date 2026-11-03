@@ -42,6 +42,18 @@ function fakeNse(path: string, body: any) {
   const reply = (b: unknown) => Promise.resolve({ status: 200, body: b });
   switch (path) {
     case 'reports/client_master_report':
+      // The member's whole client list, a week at a time: one HUF made on NSE's portal, one individual.
+      if (body.from_date) {
+        return reply(body.from_date === '27-10-2026'
+          ? { response_status: 'S', report_data: [
+            { client_code: 'RSPH000001 ', tax_status: 'HUF', primary_holder_first_name: 'PORTAL FAMILY HUF', primary_holder_middle_name: ' ', primary_holder_last_name: ' ',
+              primary_holder_pan: 'DDDHD1234D', primary_holder_dob_incorporation: '15/01/2007', account_type_1: 'SB', account_no_1: '1234567890', ifsc_code_1: 'IOBA0001234',
+              cheque_name: 'PORTAL FAMILY HUF', address_1: '5 MAIN ROAD', city: 'DELHI', state: 'DELHI', pincode: '110001', email: 'KARTA@EXAMPLE.COM', indian_mobile_no: '9999911111',
+              created_at: '27/10/2026 02:11:33 PM' },
+            { client_code: '0019', tax_status: 'INDIVIDUAL', primary_holder_first_name: 'SOME', primary_holder_pan: 'EEEPE1234E' },
+          ] }
+          : { response_status: 'F', error_remark: 'No record(s) found.' });
+      }
       if (body.pan) return reply(existingCodes.length ? { response_status: 'S', report_data: existingCodes.map((c) => ({ client_code: c })) } : { response_status: 'F', error_remark: 'No record(s) found.' });
       return reply({ response_status: 'S', report_data: [{ client_code: 'RSPH000003 ', bank_1_status: 'ACTIVE ', bank_1_status_remarks: ' ' }] });
     case 'registration/CLIENTCOMMON': return reply({ reg_details: [{ reg_status: 'REG_SUCCESS', reg_remark: ' ', reg_id: '1' }] });
@@ -270,6 +282,32 @@ test("a loopback or private address is never taken as the karta's", async () => 
   const { privateIp } = await import('../src/routes/hufs.ts');
   for (const ip of ['::1', '127.0.0.1', '::ffff:127.0.0.1', '10.0.0.4', '192.168.1.9', '172.20.1.1', 'fd12:3456::1']) assert.equal(privateIp(ip), true, ip);
   for (const ip of ['198.51.100.7', '74.225.175.227', '172.32.0.1', '2001:db8::1']) assert.equal(privateIp(ip), false, ip);
+});
+
+test('HUFs registered on NSE directly are found, added once, and their NSE details come along', async () => {
+  const { syncFromNse } = await import('../src/routes/hufs.ts');
+  const before = calls.filter((c) => c.path === 'reports/client_master_report' && c.body.from_date).length;
+  let result = await syncFromNse(new Date('2026-10-20T00:00:00Z'));
+  assert.deepEqual(result.imported, ['RSPH000001']);
+  const windows = calls.filter((c) => c.path === 'reports/client_master_report' && c.body.from_date).slice(before);
+  assert.ok(windows.every((c) => {
+    const [d1, m1, y1] = c.body.from_date.split('-').map(Number);
+    const [d2, m2, y2] = c.body.to_date.split('-').map(Number);
+    return (Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / 86_400_000 <= 6;
+  }), 'every window is at most 7 days');
+  const r = await call('asha', 'GET', '/hufs');
+  const portal = r.json.data.items.find((h: { clientCode: string }) => h.clientCode === 'RSPH000001');
+  assert.equal(portal.source, 'NSE');
+  assert.equal(portal.createdBy, null);
+  const detailRes = await call('asha', 'GET', `/hufs/${portal.id}`);
+  assert.equal(detailRes.json.data.details.state, 'DL');
+  assert.equal(detailRes.json.data.details.formedOn, '2007-01-15');
+  assert.equal(detailRes.json.data.canEdit, false);
+  assert.equal(detailRes.json.data.canUploadDocuments, true);
+  assert.equal(detailRes.json.data.events.at(-1).type, 'IMPORTED');
+  // A second sync adds nothing.
+  result = await syncFromNse(new Date('2026-10-20T00:00:00Z'));
+  assert.deepEqual(result.imported, []);
 });
 
 test('a PAN NSE already knows stops at the duplicate check', async () => {

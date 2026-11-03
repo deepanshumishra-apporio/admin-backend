@@ -14,8 +14,8 @@ import { all, nowIso, one, run } from '../db.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
 import {
-  authorisationLink, clientCodesForPan, DocumentKinds, DocumentTypes, IncomeSlabs, readHuf, readStatus, registerUcc, resendAuthorisation,
-  UccStates, uploadDocument, uploadFatca,
+  authorisationLink, clientCodesForPan, detailsFromNse, DocumentKinds, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
+  readHuf, readStatus, registerUcc, resendAuthorisation, UccStates, uploadDocument, uploadFatca,
   type Consent, type DocumentKind, type HufDetails, type NseResult, type NseStatus,
 } from '../nse/huf.ts';
 import { newId, seal, unseal } from '../security.ts';
@@ -32,8 +32,10 @@ type Row = {
   id: string; client_code: string; huf_name: string; pan_masked: string; pan_hash: string; karta_name: string; details: string; status: Status;
   consent_token_hash: string | null; consent_expires_at: string | null; consent_ip: string | null; consent_at: string | null;
   consent_user_agent: string | null; steps: string; nse_status: string | null; auth_link: string | null; auth_link_error: string | null;
-  last_error: string | null; created_by: string; approved_by: string | null; approved_at: string | null; created_at: string; updated_at: string;
+  last_error: string | null; created_by: string | null; approved_by: string | null; approved_at: string | null; created_at: string; updated_at: string;
   documents: string | null;
+  /** ADMIN: prepared here. NSE: registered on NSE directly (e.g. on its portal) and found by the sync. */
+  source: 'ADMIN' | 'NSE';
 };
 
 /** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
@@ -77,6 +79,7 @@ function listItem(r: Row, names: StaffNames) {
     pan: r.pan_masked,
     kartaName: r.karta_name,
     status: r.status,
+    source: r.source,
     bankStatus: nse?.bankStatus ?? null,
     fatca: nse?.fatca ? { cams: nse.fatca.cams.status, kfin: nse.fatca.kfin.status } : null,
     createdBy: refOf(names, r.created_by),
@@ -248,6 +251,53 @@ async function refreshOne(r: Row): Promise<void> {
   if (stepsOf(r).fatca?.ok && !r.auth_link) await fetchLink(r.id, d.clientCode);
 }
 
+/** HUF clients have existed on NSE for this member since October 2026; the first sync reads from then. */
+const SyncFrom = new Date(`${config.hufSyncFrom}T00:00:00Z`);
+const DailyMs = 24 * 3_600_000;
+let syncing: Promise<{ found: number; imported: string[] }> | null = null;
+
+/**
+ * Finds HUFs registered on NSE without this admin (RSPH000001 and RSPH000002 were made on NSE's portal) and adds
+ * them, so every HUF on NSE shows here and is kept in sync. Ones already here are left as they are.
+ */
+export function syncFromNse(since: Date = SyncFrom): Promise<{ found: number; imported: string[] }> {
+  syncing ??= (async () => {
+    const clients = await hufClientsOnNse(since, new Date());
+    const known = new Set((await all<{ client_code: string }>('SELECT client_code FROM hufs')).map((r) => r.client_code));
+    const fresh = clients.filter((c) => !known.has(trim(c.client_code).toUpperCase()));
+    const fatca = fresh.length ? await fatcaRowsFor([...new Set(fresh.map((c) => trim(c.primary_holder_pan).toUpperCase()))]) : [];
+    const imported: string[] = [];
+    for (const c of fresh) {
+      const pan = trim(c.primary_holder_pan).toUpperCase();
+      const d = detailsFromNse(c, fatca.find((f) => trim(f.pan_rp).toUpperCase() === pan) ?? null);
+      const at = nseCreatedAt(c.created_at) ?? nowIso();
+      const f = fatca.find((x) => trim(x.pan_rp).toUpperCase() === pan);
+      const steps: Steps = {
+        duplicateCheck: null,
+        ucc: { ok: true, status: 'ON_NSE', remark: 'Registered on NSE directly, not through this admin.', at },
+        fatca: f ? { ok: true, status: 'ON_NSE', remark: null, at: nseCreatedAt(f.createddatetime) ?? at } : null,
+      };
+      const id = newId();
+      const added = await run(
+        `INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, created_by, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'AWAITING_KARTA', ?, NULL, 'NSE', ?, ?) ON CONFLICT (client_code) DO NOTHING`,
+        id, d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), JSON.stringify(steps), at, nowIso(),
+      );
+      if (!added) continue;
+      imported.push(d.clientCode);
+      await event(id, 'IMPORTED', null, `Found on NSE: ${d.clientCode}, created there ${c.created_at ? trim(c.created_at) : ''}`.trim());
+      const row = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
+      await refreshOne(row!).catch((error) => console.error(`[hufs] refresh ${d.clientCode} failed:`, (error as Error).message));
+    }
+    await run("INSERT INTO jobs (name, last_run_at, last_result) VALUES ('huf-sync', ?, ?) ON CONFLICT (name) DO UPDATE SET last_run_at = excluded.last_run_at, last_result = excluded.last_result",
+      nowIso(), JSON.stringify({ found: clients.length, imported }));
+    return { found: clients.length, imported };
+  })().finally(() => (syncing = null));
+  return syncing;
+}
+
+const trim = (value: unknown): string => String(value ?? '').trim();
+
 /** Whether a HUF still has something on NSE's side to wait for: the bank check, a registrar, or the AOF. */
 function stillWaiting(r: Row): boolean {
   if (r.status === 'AWAITING_KARTA') return true;
@@ -265,12 +315,20 @@ function stillWaiting(r: Row): boolean {
 export function startHufStatusLoop(): void {
   const tick = async () => {
     if (!nseConfigured() || (nseIsLive() && !config.nse.allowProd)) return;
+    // Once a day, pick up HUFs made on NSE directly in the last two weeks (the first run reads from the start).
+    const last = await one<{ last_run_at: string }>("SELECT last_run_at FROM jobs WHERE name = 'huf-sync'");
+    if (!last || Date.now() - Date.parse(last.last_run_at) > DailyMs) {
+      await syncFromNse(last ? new Date(Date.now() - 14 * DailyMs) : SyncFrom)
+        .catch((error) => console.error('[hufs] sync from NSE failed:', (error as Error).message));
+    }
     const waiting = (await all<Row>("SELECT * FROM hufs WHERE status IN ('AWAITING_KARTA', 'ACTIVE')")).filter(stillWaiting);
     for (const r of waiting) {
       await refreshOne(r).catch((error) => console.error(`[hufs] refresh ${r.client_code} failed:`, (error as Error).message));
     }
   };
-  setInterval(() => void tick().catch((error) => console.error('[hufs] status loop failed:', (error as Error).message)), config.hufStatusIntervalMs).unref();
+  const run_ = () => void tick().catch((error) => console.error('[hufs] status loop failed:', (error as Error).message));
+  setTimeout(run_, 60_000).unref();
+  setInterval(run_, config.hufStatusIntervalMs).unref();
 }
 
 // --- the karta's consent page (public) ------------------------------------------------------------------------
@@ -308,8 +366,22 @@ export function hufRoutes(router: Router): void {
     states: Object.entries(UccStates).map(([code, s]) => ({ code, name: s.name })).sort((a, b) => a.name.localeCompare(b.name)),
     incomeSlabs: IncomeSlabs.map((code, i) => ({ code, label: ['Below ₹1 lakh', '₹1-5 lakh', '₹5-10 lakh', '₹10-25 lakh', '₹25 lakh-1 crore', 'Above ₹1 crore'][i]! })),
     nse: { environment: nseIsLive() ? 'LIVE' : 'UAT', configured: nseConfigured(), liveAllowed: config.nse.allowProd },
+    lastSyncAt: (await one<{ last_run_at: string }>("SELECT last_run_at FROM jobs WHERE name = 'huf-sync'"))?.last_run_at ?? null,
     secondApprover: config.hufSecondApprover,
   }));
+
+  /** Adds HUFs registered on NSE directly. Also runs once a day on its own. */
+  router.post('/hufs/sync', full, manage, async (ctx) => {
+    if (!nseConfigured() || (nseIsLive() && !config.nse.allowProd)) throw HttpError.unavailable('NSE is not configured on this server.');
+    try {
+      const result = await syncFromNse();
+      await audit(ctx, 'huf.synced', null, result);
+      return result;
+    } catch (error) {
+      if (error instanceof NseError) throw new HttpError(502, 'NSE_UNAVAILABLE', `Couldn't read from NSE: ${error.message}`);
+      throw error;
+    }
+  });
 
   router.get('/hufs', full, manage, async (ctx) => {
     const statuses = listParam(ctx.query, 'status', Statuses);
