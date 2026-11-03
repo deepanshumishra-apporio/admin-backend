@@ -77,6 +77,9 @@ export const config = {
     timeoutMs: Number(env('NSE_TIMEOUT_MS', '60000')),
     /** FATCA UBO_CODE for the karta. Not in NSE's doc; C01 is NSE's own sample value. */
     hufUboCode: env('NSE_HUF_UBO_CODE', 'C01'),
+    /** The distributor employee's EUIN (E + 6 digits) on orders and SIPs; blank sends euin_declaration N. */
+    euin: env('NSE_EUIN', ''),
+    subBrokerArn: env('NSE_SUB_BROKER_ARN', ''),
   },
   /** A second staff member must approve a HUF before it is sent to NSE. Only turn off for a one-person test setup. */
   hufSecondApprover: env('HUF_SECOND_APPROVER', 'true') !== 'false',

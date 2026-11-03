@@ -7,6 +7,7 @@ import { closeDb, migrate } from './db.ts';
 import { handle, Router } from './http.ts';
 import { announcementRoutes } from './routes/announcements.ts';
 import { complianceRoutes, startComplianceLoop } from './routes/compliance.ts';
+import { hufInvestRoutes, startInvestmentLoop } from './routes/huf-invest.ts';
 import { hufRoutes, startHufStatusLoop } from './routes/hufs.ts';
 import { investorRoutes } from './routes/investors.ts';
 import { meetingRoutes } from './routes/meetings.ts';
@@ -34,6 +35,8 @@ complianceRoutes(router);
 supportRoutes(router);
 announcementRoutes(router);
 meetingRoutes(router);
+// Before hufRoutes: its /hufs/:id would otherwise take /hufs/schemes.
+hufInvestRoutes(router);
 hufRoutes(router);
 
 const server = createServer((req, res) => void handle(router, '/api/v1/admin', req, res));
@@ -45,6 +48,7 @@ server.listen(config.port, config.host, () => {
 startValuationLoop();
 startComplianceLoop();
 startHufStatusLoop();
+startInvestmentLoop();
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {

@@ -28,7 +28,7 @@ const DayMs = 86_400_000;
 type Step = (NseResult & { at: string }) | null;
 type Steps = { duplicateCheck: { at: string; codes: string[] } | null; ucc: Step; fatca: Step };
 
-type Row = {
+export type Row = {
   id: string; client_code: string; huf_name: string; pan_masked: string; pan_hash: string; karta_name: string; details: string; status: Status;
   consent_token_hash: string | null; consent_expires_at: string | null; consent_ip: string | null; consent_at: string | null;
   consent_user_agent: string | null; steps: string; nse_status: string | null; auth_link: string | null; auth_link_error: string | null;
@@ -41,7 +41,7 @@ type Row = {
 /** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
 type DocumentRecord = NseResult & { fileName: string; contentType: string; bytes: number; sha256: string; uploadedAt: string; uploadedBy: string };
 type Documents = Partial<Record<DocumentKind, DocumentRecord>>;
-const documentsOf = (r: Row): Documents => (r.documents ? (JSON.parse(r.documents) as Documents) : {});
+export const documentsOf = (r: Row): Documents => (r.documents ? (JSON.parse(r.documents) as Documents) : {});
 const MaxDocumentBytes = 3 * 1024 * 1024;
 /** What each accepted file type starts with, so a renamed file of another type is refused. */
 const Signatures: Record<string, (b: Buffer) => boolean> = {
@@ -161,7 +161,7 @@ function approvalBlock(r: Row, ctx: Ctx): string | null {
   return null;
 }
 
-async function event(hufId: string, type: string, staffId: string | null, note: string | null = null): Promise<void> {
+export async function event(hufId: string, type: string, staffId: string | null, note: string | null = null): Promise<void> {
   await run('INSERT INTO huf_events (id, huf_id, type, staff_id, note, created_at) VALUES (?, ?, ?, ?, ?, ?)', newId(), hufId, type, staffId, note, nowIso());
 }
 

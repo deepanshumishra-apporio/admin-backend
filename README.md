@@ -111,6 +111,16 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   `client_master_report` (7-day windows, from `HUF_SYNC_FROM`, default 2026-10-01; tax status HUF) and added with
   `source = 'NSE'`, details from the client master and FATCA_REPORT. Once a day (last 14 days), and on "Sync from NSE".
 - **Active**: NSE's authorisation report is empty for HUFs, so staff mark a HUF active once an order is accepted.
+- **Investments** ([src/nse/invest.ts](src/nse/invest.ts), [src/routes/huf-invest.ts](src/routes/huf-invest.ts)): orders
+  (`ORDER_STATUS`, 7-day windows), allotments and redemptions (30-day windows), SIPs (`XSIP_REG_REPORT`) and mandates
+  (`MANDATE_STATUS`) are read from NSE and kept in `hufs.investments`, again once a day on their own. NSE has no holdings
+  API: holdings are allotted units less redeemed ones, valued at the latest NAV. The scheme, NAV and SIP masters
+  (`MASTER_DOWNLOAD`, a few MB each) are loaded once a day.
+- **Investing from the admin**: a lumpsum purchase (`transaction/NORMAL`, physical, then the `PUR` payment link), an
+  eNACH mandate on the HUF's account (`registration/product/MANDATE`, `MANDATE_AUTH` link) and a monthly SIP on an
+  approved mandate (`registration/product/XSIP`, `XSIP_REG` link). Checked first against the scheme and SIP masters,
+  and refused until NSE's bank check has passed and the AOF is on NSE. NSE asks the karta to confirm every one, so
+  staff can start but never complete an investment. Orders carry `NSE_EUIN` (`NSE_SUB_BROKER_ARN` if set).
 - **No eLog**: NSE's ELOG API is for individuals only.
 - **Tested**: `test/hufs.test.ts` against a fake NSE; and end to end on NSE UAT on 2 Nov 2026 through the dashboard
   (UCC and FATCA with the karta as UBO accepted, client `HUFT582104`). Not yet proven: KFin accepting that FATCA
