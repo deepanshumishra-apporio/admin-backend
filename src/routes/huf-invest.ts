@@ -3,6 +3,7 @@
 // approved mandate (the karta approves it on NSE). Staff only start these; NSE needs the karta for each.
 import { randomBytes } from 'node:crypto';
 
+import { amfiDirectory, amfiDirectoryOrEmpty, isoDate, navHistory, returnsOf, thin, type AmfiFund } from '../amfi.ts';
 import { audit, authenticate, need, refOf, staffNames } from '../auth.ts';
 import { config, nseIsLive } from '../config.ts';
 import { all, nowIso, one, run } from '../db.ts';
@@ -118,6 +119,37 @@ const schemeView = (s: Scheme) => ({
   sipAllowed: s.sipAllowed, sipMonthly: s.sip['MONTHLY'] ?? null,
 });
 
+/** Direct or Regular, Growth or IDCW: from AMFI when it lists the fund, else from NSE's scheme name. */
+const planOf = (s: Scheme, a: AmfiFund | undefined) => (a?.plan ? (/direct/i.test(a.plan) ? 'Direct' : 'Regular') : /DIRECT/.test(s.name) ? 'Direct' : 'Regular');
+const optionOf = (s: Scheme, a: AmfiFund | undefined) => (/IDCW|DIVIDEND|PAYOUT|REINVEST/i.test(a ? a.option ?? '' : s.name) ? 'IDCW' : 'Growth');
+
+/** NSE's NAV date ("02-11-2026", "02-Nov-2026" or ISO) as ISO, for comparing with AMFI's. */
+const isoOfNse = (v: string) => isoDate(v) ?? v;
+
+/** A scheme with what AMFI adds: its SEBI category, fund house and AMFI code (for its NAV history). */
+const fundView = (s: Scheme, a: AmfiFund | undefined) => ({
+  ...schemeView(s),
+  amcName: a?.fundHouse || s.amcName,
+  amfiCode: a?.amfiCode ?? null,
+  // AMFI's "Axis Children's Fund", against NSE's "AXIS CHILDREN'S FUND - DIRECT PLAN - GROWTH".
+  displayName: a?.name || null,
+  assetClass: a?.assetClass ?? null,
+  category: a?.category ?? null,
+  structure: a?.structure ?? null,
+  planName: planOf(s, a),
+  option: optionOf(s, a),
+  // AMFI's NAV is often a day newer than NSE's master.
+  ...(a?.nav && a.navDate && (!s.navDate || a.navDate >= isoOfNse(s.navDate)) ? { nav: a.nav, navDate: a.navDate } : {}),
+});
+type FundView = ReturnType<typeof fundView>;
+
+const word = (v: string | null | undefined) => String(v ?? '').trim();
+/** Each value once, with how many funds have it, most common first. */
+const facet = (values: string[]) =>
+  [...values.reduce((m, v) => (v ? m.set(v, (m.get(v) ?? 0) + 1) : m), new Map<string, number>())]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
 export function hufInvestRoutes(router: Router): void {
   const full = authenticate('full');
   const manage = need('hufs.manage');
@@ -132,11 +164,68 @@ export function hufInvestRoutes(router: Router): void {
     }
   });
 
-  /** One fund as NSE's masters describe it: the fund screen's "about" and its purchase and SIP rules. */
+  /**
+   * Every fund open for purchase on NSE, with AMFI's category: searchable by name, code, ISIN or fund house and
+   * filtered by asset class, category, fund house, plan, option and SIP. Each facet counts what the other filters leave.
+   */
+  router.get('/hufs/funds', full, manage, async (ctx) => {
+    const q = ctx.query;
+    const words = word(q.get('search')).toUpperCase().split(/\s+/).filter(Boolean).slice(0, 8);
+    const want = {
+      assetClass: word(q.get('assetClass')), category: word(q.get('category')), fundHouse: word(q.get('fundHouse')),
+      plan: word(q.get('plan')), option: word(q.get('option')),
+    };
+    const sipOnly = q.get('sip') === '1';
+    const pageSize = Math.min(50, Math.max(5, Number(q.get('limit')) || 25));
+    const page = Math.max(1, Math.floor(Number(q.get('page')) || 1));
+    const [schemes, amfi] = await Promise.all([schemesFromNse().catch(nseFailure), amfiDirectoryOrEmpty()]);
+    const all = [...schemes.values()].filter((s) => s.purchaseAllowed).map((s) => fundView(s, amfi.get(s.isin)));
+    const matches = (f: FundView, ...skip: (keyof typeof want)[]) =>
+      (!words.length || words.every((w) => `${f.schemeCode} ${f.name} ${f.isin} ${f.amcName.toUpperCase()}`.includes(w))) &&
+      (!sipOnly || Boolean(f.sipMonthly)) &&
+      (skip.includes('assetClass') || !want.assetClass || f.assetClass === want.assetClass) &&
+      (skip.includes('category') || !want.category || f.category === want.category) &&
+      (skip.includes('fundHouse') || !want.fundHouse || f.amcName === want.fundHouse) &&
+      (skip.includes('plan') || !want.plan || f.planName === want.plan) &&
+      (skip.includes('option') || !want.option || f.option === want.option);
+    const hits = all.filter((f) => matches(f)).sort((a, b) => a.name.localeCompare(b.name));
+    const facetOf = (keys: (keyof typeof want)[], value: (f: FundView) => string | null) => facet(all.filter((f) => matches(f, ...keys)).map((f) => value(f) ?? ''));
+    return {
+      items: hits.slice((page - 1) * pageSize, page * pageSize),
+      total: hits.length,
+      page,
+      pageSize,
+      catalogue: all.length,
+      categorised: amfi.size > 0,
+      facets: {
+        assetClasses: facetOf(['assetClass', 'category'], (f) => f.assetClass),
+        categories: facetOf(['category'], (f) => f.category),
+        fundHouses: facetOf(['fundHouse'], (f) => f.amcName),
+        plans: facetOf(['plan'], (f) => f.planName),
+        options: facetOf(['option'], (f) => f.option),
+      },
+    };
+  });
+
+  /** One fund as NSE's masters describe it, with AMFI's category: the fund screen's "about" and its purchase and SIP rules. */
   router.get('/hufs/schemes/:code', full, manage, async (ctx) => {
     const s = (await schemesFromNse().catch(nseFailure)).get(String(ctx.params['code'] ?? '').toUpperCase());
     if (!s) throw HttpError.notFound('NSE has no scheme with that code.');
-    return schemeView(s);
+    return fundView(s, (await amfiDirectoryOrEmpty()).get(s.isin));
+  });
+
+  /** A fund's NAV history (thinned for a chart) and its returns, from AMFI's NAVs. */
+  router.get('/hufs/schemes/:code/history', full, manage, async (ctx) => {
+    const s = (await schemesFromNse().catch(nseFailure)).get(String(ctx.params['code'] ?? '').toUpperCase());
+    if (!s) throw HttpError.notFound('NSE has no scheme with that code.');
+    const a = (await amfiDirectory().catch(() => new Map<string, AmfiFund>())).get(s.isin);
+    if (!a) return { amfiCode: null, points: [], returns: returnsOf([]), error: "AMFI doesn't list this fund's ISIN, so there's no NAV history for it." };
+    try {
+      const points = await navHistory(a.amfiCode);
+      return { amfiCode: a.amfiCode, points: thin(points), returns: returnsOf(points), error: points.length ? null : 'No NAV history yet.' };
+    } catch (error) {
+      return { amfiCode: a.amfiCode, points: [], returns: returnsOf([]), error: `NAV history couldn't be read just now (${(error as Error).message}).` };
+    }
   });
 
   router.get('/hufs/:id/investments', full, manage, async (ctx) => view(await load(uuidParam(ctx, 'id'))));

@@ -22,6 +22,7 @@ const { newToken, tokenId, seal, newId } = await import('../src/security.ts');
 const { setNseTransport } = await import('../src/nse/client.ts');
 const { readHuf } = await import('../src/nse/huf.ts');
 const { buildSchemes, sipProblem } = await import('../src/nse/invest.ts');
+const { classify, parseHistory, parseNavAll, returnsOf, thin } = await import('../src/amfi.ts');
 
 const Sch = [
   'UNIQUE SR NO|SCHEME CODE|RTA SCHEME CODE|AMC SCHEME CODE|ISIN|AMC CODE|SCHEME TYPE|PLAN TYPE|SCHEME NAME|PURCHASE ALLOWED|PURCHASE TRANSACTION MODE|NEW PURCHASE MIN AMOUNT|ADDITIONAL PURCHASE MIN AMOUNT|ADDITIONAL PURCHASE MAX AMOUNT|PURCHASE AMOUNT MULTIPLIER|PURCHASE CUTOFF TIME|REDEMPTION ALLOWED|REDEMPTION TRANSACTION MODE|REDEMPTION MIN QTY|REDEMPTION QTY MULTIPLIER|REDEMPTION MAX QTY|REDEMPTION MIN AMOUNT|REDEMPTION MAX AMOUNT|REDEMPTION AMOUNT MULTIPLIER|REDEMPTION CUTOFF TIME|RTA AGENT CODE|AMC ACTIVE FLAG|DIV REINVEST FLAG|SIP ALLOWED',
@@ -67,6 +68,7 @@ let server: Server;
 let base = '';
 let token = '';
 let hufId = '';
+const fetched: string[] = [];
 
 async function call(method: string, path: string, body?: unknown) {
   const res = await fetch(`${base}/api/v1/admin${path}`, {
@@ -96,6 +98,14 @@ before(async () => {
     VALUES (?, 'RSPH000001', 'PORTAL FAMILY HUF', 'x', 'x', 'KARTA', ?, 'AWAITING_KARTA', ?, ?, 'NSE', '2026-10-27T08:41:33.000Z', ?)`,
     hufId, seal(details), JSON.stringify(steps), JSON.stringify({ bankStatus: 'PENDING', bankRemark: null, fatca: null, authorised: null, checkedAt: now }), now);
   setNseTransport(fakeNse as never);
+  // AMFI and mfapi.in, faked; the test's own calls to the local server go through.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.includes('amfiindia.com')) { fetched.push(url); return Promise.resolve(new Response(NavAll)); }
+    if (url.includes('mfapi.in')) { fetched.push(url); return Promise.resolve(Response.json({ data: [{ date: '03-11-2026', nav: '40.5' }, { date: '03-11-2025', nav: '30' }] })); }
+    return realFetch(input, init);
+  }) as typeof fetch;
   const router = new Router();
   hufInvestRoutes(router);
   hufRoutes(router);
@@ -192,4 +202,64 @@ test('a SIP needs an approved mandate; the mandate is eNACH on the HUF account',
   assert.equal(x.frequency_type, 'MONTHLY');
   assert.equal(r.json.data.requests[0].kind, 'SIP');
   assert.equal(r.json.data.requests[0].link, 'https://nseinvest.com/mf/xsip_reg');
+});
+
+const NavAll = [
+  'Scheme Code;ISIN Div Payout/ ISIN Growth;ISIN Div Reinvestment;Scheme Name;Plan;Option;Net Asset Value;Date',
+  '',
+  'Open Ended Schemes(Index Funds - Equity Funds)',
+  '',
+  'Nippon India Mutual Fund',
+  '',
+  '118482;INF204K01IE3;-;Nippon India Index Fund - Nifty 50 Plan;Regular Plan;Growth Option;40.5000;03-Nov-2026',
+].join('\n');
+
+test("AMFI: categories and fund houses by ISIN; returns from a NAV history", () => {
+  const byIsin = parseNavAll(NavAll);
+  assert.deepEqual({ ...byIsin.get('INF204K01IE3') }, {
+    amfiCode: '118482', name: 'Nippon India Index Fund - Nifty 50 Plan', fundHouse: 'Nippon India Mutual Fund', structure: 'Open Ended', assetClass: 'Index funds', category: 'Equity Funds',
+    plan: 'Regular Plan', option: 'Growth Option', nav: 40.5, navDate: '2026-11-03',
+  });
+  assert.deepEqual(classify('Open Ended Schemes(Equity Schemes - ELSS- Tax Saver Fund)'), { structure: 'Open Ended', assetClass: 'Equity', category: 'ELSS (tax saver)' });
+  assert.equal(classify('Open Ended Schemes(Income/Debt Oriented Schemes - Liquid Fund)').assetClass, 'Debt');
+  assert.equal(classify('Open Ended Schemes(Exchange Traded Funds (ETFs) - Gold ETF)').assetClass, 'ETFs');
+
+  // Mid-month dates, so a month back lands on a real day.
+  const points = parseHistory({ data: [
+    { date: '15-10-2026', nav: '121' }, { date: '15-09-2026', nav: '110' }, { date: '15-10-2025', nav: '100' }, { date: '15-10-2023', nav: '50' }, { date: 'bad', nav: '1' },
+  ] });
+  assert.equal(points[0]![0], '2023-10-15', 'oldest first');
+  const r = returnsOf(points);
+  const p = Object.fromEntries(r.periods.map((x) => [x.key, x.percent]));
+  assert.equal(p['1M'], 10);
+  assert.equal(p['1Y'], 21);
+  assert.equal(p['3Y'], 34.26, '121/50 over three years, compounded');
+  assert.equal(p['5Y'], null, 'younger than five years');
+  assert.deepEqual(r.high52, { nav: 121, date: '2026-10-15' });
+  assert.deepEqual(r.low52, { nav: 100, date: '2025-10-15' });
+  const many = Array.from({ length: 5000 }, (_, i) => [new Date(Date.UTC(2010, 0, 1) + i * 86_400_000).toISOString().slice(0, 10), i + 1] as [string, number]);
+  const t = thin(many, 1000);
+  assert.ok(t.length <= 1001 && t.at(-1)![0] === many.at(-1)![0]);
+});
+
+test('fund catalogue: every purchasable fund with AMFI facets; a fund with its NAV history', async () => {
+  let r = await call('GET', '/hufs/funds');
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.data.total, 1);
+  const f = r.json.data.items[0];
+  assert.equal(f.schemeCode, 'RMFSCBP-GR');
+  assert.equal(f.amcName, 'Nippon India Mutual Fund');
+  assert.equal(f.category, 'Equity Funds');
+  assert.equal(f.planName, 'Regular');
+  assert.equal(f.nav, 40.5, "AMFI's newer NAV");
+  assert.deepEqual(r.json.data.facets.assetClasses, [{ name: 'Index funds', count: 1 }]);
+  assert.equal((await call('GET', '/hufs/funds?assetClass=Debt')).json.data.total, 0);
+  assert.equal((await call('GET', '/hufs/funds?search=nippon%20nifty&plan=Regular&sip=1')).json.data.total, 1);
+
+  r = await call('GET', '/hufs/schemes/RMFSCBP-GR/history');
+  assert.equal(r.status, 200);
+  assert.equal(r.json.data.amfiCode, '118482');
+  assert.deepEqual(r.json.data.points, [['2025-11-03', 30], ['2026-11-03', 40.5]]);
+  assert.equal(r.json.data.returns.periods.find((x: any) => x.key === '1Y').percent, 35);
+  assert.ok(fetched.every((u) => !/client|RSPH|PAN/i.test(u)), 'nothing about the HUF goes to AMFI');
 });

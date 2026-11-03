@@ -116,6 +116,10 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   (`MANDATE_STATUS`) are read from NSE and kept in `hufs.investments`, again once a day on their own. NSE has no holdings
   API: holdings are allotted units less redeemed ones, valued at the latest NAV. The scheme, NAV and SIP masters
   (`MASTER_DOWNLOAD`, a few MB each) are loaded once a day.
+- **Fund catalogue and charts** ([src/amfi.ts](src/amfi.ts)): `GET /hufs/funds` lists every scheme open for purchase
+  on NSE with its SEBI category and fund house from AMFI's daily `NAVAll.txt` (matched by ISIN, loaded once a day).
+  `GET /hufs/schemes/:code/history` gives the NAV history for the fund's chart and its returns, from mfapi.in (a free
+  mirror of AMFI's NAVs; AMFI has no history API), cached six hours. Only public fund codes are sent to either.
 - **Investing from the admin**: a lumpsum purchase (`transaction/NORMAL`, physical, then the `PUR` payment link), an
   eNACH mandate on the HUF's account (`registration/product/MANDATE`, `MANDATE_AUTH` link) and a monthly SIP on an
   approved mandate (`registration/product/XSIP`, `XSIP_REG` link). Checked first against the scheme and SIP masters,
