@@ -27,7 +27,12 @@ export type Scheme = {
   schemeCode: string; name: string; isin: string; amcCode: string; type: string; rta: string;
   purchaseAllowed: boolean; minFresh: number | null; minAdditional: number | null; multiplier: number | null; cutoff: string;
   sipAllowed: boolean; nav: number | null; navDate: string | null; sip: Record<string, SipRule>;
+  /** About the fund, from NSE's scheme master; null when the master doesn't say. */
+  amcName: string; plan: string | null; settlement: string | null; redemptionAllowed: boolean; redemptionMinAmount: number | null;
+  exitLoad: string | null; lockInDays: number | null; launchedOn: string | null; openEnded: boolean | null;
 };
+
+const amcNameOf = (code: string) => code.replace(/_MF$/, '').replace(/MUTUALFUND$/, ' MUTUAL FUND').replace(/_/g, ' ').trim();
 
 let masters: { at: number; schemes: Map<string, Scheme> } | null = null;
 let loading: Promise<Map<string, Scheme>> | null = null;
@@ -59,6 +64,12 @@ export function buildSchemes(sch: string, nav: string, sip: string): Map<string,
       purchaseAllowed: r['PURCHASE ALLOWED'] === 'Y', minFresh: num(r['NEW PURCHASE MIN AMOUNT']), minAdditional: num(r['ADDITIONAL PURCHASE MIN AMOUNT']),
       multiplier: num(r['PURCHASE AMOUNT MULTIPLIER']), cutoff: trim(r['PURCHASE CUTOFF TIME']), sipAllowed: r['SIP ALLOWED'] === 'Y',
       nav: null, navDate: null, sip: {},
+      amcName: amcNameOf(up(r['AMC CODE'])), plan: trim(r['PLAN TYPE']) || null, settlement: trim(r['SETTLEMENT TYPE']) || null,
+      redemptionAllowed: r['REDEMPTION ALLOWED'] === 'Y', redemptionMinAmount: num(r['REDEMPTION MIN AMOUNT']),
+      exitLoad: r['EXIT LOAD FLAG'] === 'Y' ? trim(r['EXIT LOAD']) || 'Yes' : r['EXIT LOAD FLAG'] === 'N' ? 'None' : null,
+      lockInDays: r['LOCK IN PERIOD_FLAG'] === 'Y' ? num(r['LOCK IN PERIOD']) : null,
+      launchedOn: trim(r['SCHEME START DATE']) || null,
+      openEnded: r['OPEN/CLOSE ENDED SCHEME'] ? /^O/i.test(r['OPEN/CLOSE ENDED SCHEME']) : null,
     });
   }
   // The NAV file has no header: date|scheme code|name|rta code|div flag|isin|nav|rta.

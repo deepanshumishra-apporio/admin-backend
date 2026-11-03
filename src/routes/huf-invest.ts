@@ -110,6 +110,14 @@ const amountOf = (v: unknown): number => {
   return n;
 };
 
+const schemeView = (s: Scheme) => ({
+  schemeCode: s.schemeCode, name: s.name, isin: s.isin, type: s.type, amcCode: s.amcCode, amcName: s.amcName, rta: s.rta, plan: s.plan,
+  minFresh: s.minFresh, minAdditional: s.minAdditional, multiplier: s.multiplier, cutoff: s.cutoff, nav: s.nav, navDate: s.navDate,
+  purchaseAllowed: s.purchaseAllowed, redemptionAllowed: s.redemptionAllowed, redemptionMinAmount: s.redemptionMinAmount,
+  exitLoad: s.exitLoad, lockInDays: s.lockInDays, launchedOn: s.launchedOn, openEnded: s.openEnded, settlement: s.settlement,
+  sipAllowed: s.sipAllowed, sipMonthly: s.sip['MONTHLY'] ?? null,
+});
+
 export function hufInvestRoutes(router: Router): void {
   const full = authenticate('full');
   const manage = need('hufs.manage');
@@ -118,13 +126,17 @@ export function hufInvestRoutes(router: Router): void {
     const q = ctx.query.get('search')?.trim() ?? '';
     if (q.length < 3) return [];
     try {
-      return (await searchSchemes(q, 25)).map((s) => ({
-        schemeCode: s.schemeCode, name: s.name, isin: s.isin, type: s.type, minFresh: s.minFresh, minAdditional: s.minAdditional,
-        multiplier: s.multiplier, cutoff: s.cutoff, nav: s.nav, navDate: s.navDate, sipAllowed: s.sipAllowed, sipMonthly: s.sip['MONTHLY'] ?? null,
-      }));
+      return (await searchSchemes(q, 25)).map(schemeView);
     } catch (error) {
       return nseFailure(error);
     }
+  });
+
+  /** One fund as NSE's masters describe it: the fund screen's "about" and its purchase and SIP rules. */
+  router.get('/hufs/schemes/:code', full, manage, async (ctx) => {
+    const s = (await schemesFromNse().catch(nseFailure)).get(String(ctx.params['code'] ?? '').toUpperCase());
+    if (!s) throw HttpError.notFound('NSE has no scheme with that code.');
+    return schemeView(s);
   });
 
   router.get('/hufs/:id/investments', full, manage, async (ctx) => view(await load(uuidParam(ctx, 'id'))));
