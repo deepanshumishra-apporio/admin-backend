@@ -107,7 +107,9 @@ function problems(r: Row, nse: NseStatus | null): string[] {
     if (s.status === 'REJECTED') out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the FATCA declaration${s.remark ? `: ${s.remark}` : ''}.`);
   }
   const docs = documentsOf(r);
-  if ((r.status === 'AWAITING_KARTA' || r.status === 'ACTIVE') && !docs.AOF?.ok) {
+  // An AOF uploaded on NSE's portal counts too: the registrars' verdict shows it is there.
+  const aofOnNse = nse?.aof?.cams.status === 'ACCEPTED' || nse?.aof?.kfin.status === 'ACCEPTED';
+  if ((r.status === 'AWAITING_KARTA' || r.status === 'ACTIVE') && !docs.AOF?.ok && !aofOnNse) {
     out.push("Upload the AOF signed by the karta. For a non-demat order NSE checks an eLog or AOF is on file, and a HUF can't have an eLog.");
   }
   for (const [name, s] of Object.entries(nse?.aof ?? {})) {
