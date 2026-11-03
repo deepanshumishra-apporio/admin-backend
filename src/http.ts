@@ -99,14 +99,16 @@ export class Router {
 }
 
 const MaxBody = 1024 * 1024;
+/** A HUF document (a scanned, signed form) arrives base64-encoded: 3 MB of file is about 4 MB of JSON. */
+const MaxUploadBody = 5 * 1024 * 1024;
 
-async function readBody(req: IncomingMessage): Promise<any> {
+async function readBody(req: IncomingMessage, limit: number): Promise<any> {
   if (req.method === 'GET' || req.method === 'HEAD') return undefined;
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += (chunk as Buffer).length;
-    if (size > MaxBody) throw new HttpError(413, 'PAYLOAD_TOO_LARGE', 'The request is too large.');
+    if (size > limit) throw new HttpError(413, 'PAYLOAD_TOO_LARGE', 'The request is too large.');
     chunks.push(chunk as Buffer);
   }
   if (size === 0) return undefined;
@@ -169,7 +171,7 @@ export async function handle(router: Router, prefix: string, req: IncomingMessag
       path,
       params: found.params,
       query: url.searchParams,
-      body: await readBody(req),
+      body: await readBody(req, /^\/hufs\/[^/]+\/documents$/.test(path) ? MaxUploadBody : MaxBody),
       ip: vouched ?? clientIp(req),
       ipFromDashboard: vouched !== null,
       userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'].slice(0, 400) : null,

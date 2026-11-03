@@ -34,6 +34,9 @@ const huf = {
 const calls: { path: string; body: any }[] = [];
 let fatcaAnswer = { reg_status: 'REG_SUCCESS', reg_remark: 'FATCA DETAILS UPLOADED SUCCESSFULLY' };
 let existingCodes: string[] = [];
+let uploadAnswer: Record<string, string> = { status: '100', message: 'Image Uploaded Successfully.' };
+/** The smallest real PDF header, padded: enough for the file-signature check. */
+const pdf = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(200, 32)]).toString('base64');
 function fakeNse(path: string, body: any) {
   calls.push({ path, body });
   const reply = (b: unknown) => Promise.resolve({ status: 200, body: b });
@@ -48,6 +51,12 @@ function fakeNse(path: string, body: any) {
     case 'reports/FATCA_REPORT': return reply({ response_status: 'S', report_data: [{ pan_rp: 'AAAHA1234A', createddatetime: '02/11/2026 11:50:12 AM',
       camsuploadstatus: 'UPLOADED', camsresponsestatus: 'ACCEPTED', camsremarks: ' ', kfinuploadstatus: 'UPLOADED', kfinresponsestatus: 'REJECTED', kfinremarks: 'TEST REMARK' }] });
     case 'registration/RESEND_COMM': return reply({ response_status: 'S', error_remark: '' });
+    case 'fileupload/AOFIMG': return reply(uploadAnswer);
+    case 'fileupload/FATCAIMG': return reply(uploadAnswer);
+    case 'fileupload/CANCELCHEQUE': return reply({ status: '100', message: 'Cheque Uploaded Successfully.' });
+    case 'reports/AOF_IMAGE_UPLOAD_REPORT': return reply(calls.some((c) => c.path === 'fileupload/AOFIMG')
+      ? { response_status: 'S', report_data: [{ client_code: 'RSPH000003', created_at: '03/11/2026 11:58 AM', cams_status: 'Uploaded - Ready to invest', cams_reason: ' ', kfin_status: 'Under review', kfin_reason: ' ' }] }
+      : { response_status: 'F', error_remark: 'No record(s) found.' });
     default: return Promise.reject(new Error(`unexpected NSE call ${path}`));
   }
 }
@@ -217,6 +226,39 @@ test('a HUF from draft to waiting on the karta', async () => {
   assert.equal(r.json.data.nse.authorised, null);
   assert.equal(r.json.data.status, 'AWAITING_KARTA');
   assert.ok(r.json.data.problems.some((p: string) => /KFin rejected.*TEST REMARK/.test(p)));
+
+  // Until the signed AOF is on NSE, the HUF can't invest: it shows as a problem.
+  assert.ok(r.json.data.problems.some((p: string) => /AOF signed by the karta/.test(p)));
+
+  // Documents: only real PDF/JPG/PNG/TIFF under 3 MB; NSE's refusal is reported and kept, and doesn't count as done.
+  r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/pdf', data: Buffer.from('not a pdf').toString('base64') });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error.message, /not really a PDF/);
+  r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/zip', data: pdf });
+  assert.equal(r.status, 400);
+  uploadAnswer = { status: '101', message: 'Invalid file' };
+  r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/pdf', data: pdf });
+  assert.equal(r.status, 409);
+  assert.match(r.json.error.message, /Invalid file/);
+  uploadAnswer = { status: '100', message: 'Image Uploaded Successfully.' };
+  r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/pdf', data: pdf });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.data.documents.AOF.ok, true);
+  assert.ok(!r.json.data.problems.some((p: string) => /AOF signed by the karta/.test(p)));
+  const aofCall = calls.filter((c) => c.path === 'fileupload/AOFIMG').at(-1)!.body;
+  assert.equal(aofCall.client_code, 'RSPH000003');
+  assert.equal(aofCall.document_type, 'NRM');
+  assert.ok(aofCall.file_name.length <= 40);
+  r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'CANCELLED_CHEQUE', contentType: 'application/pdf', data: pdf });
+  assert.equal(r.json.data.documents.CANCELLED_CHEQUE.ok, true);
+  assert.equal(calls.filter((c) => c.path === 'fileupload/CANCELCHEQUE').at(-1)!.body.account_no, '123456789012');
+  const docsRow = await one<{ documents: string }>('SELECT documents FROM hufs WHERE id = ?', id);
+  assert.ok(!docsRow!.documents.includes(pdf.slice(0, 20)), 'the file itself is not stored');
+
+  // The registrars' verdict on the AOF comes back with the status.
+  r = await call('asha', 'POST', `/hufs/${id}/refresh`);
+  assert.equal(r.json.data.nse.aof.cams.status, 'ACCEPTED');
+  assert.equal(r.json.data.nse.aof.kfin.status, 'PENDING');
 
   assert.equal((await call('asha', 'POST', `/hufs/${id}/resend-link`)).status, 200);
   assert.equal((await call('asha', 'POST', `/hufs/${id}/mark-active`, {})).status, 400);

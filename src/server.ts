@@ -7,7 +7,7 @@ import { closeDb, migrate } from './db.ts';
 import { handle, Router } from './http.ts';
 import { announcementRoutes } from './routes/announcements.ts';
 import { complianceRoutes, startComplianceLoop } from './routes/compliance.ts';
-import { hufRoutes } from './routes/hufs.ts';
+import { hufRoutes, startHufStatusLoop } from './routes/hufs.ts';
 import { investorRoutes } from './routes/investors.ts';
 import { meetingRoutes } from './routes/meetings.ts';
 import { reportRoutes } from './routes/reports.ts';
@@ -44,6 +44,7 @@ server.listen(config.port, config.host, () => {
 
 startValuationLoop();
 startComplianceLoop();
+startHufStatusLoop();
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {

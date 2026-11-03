@@ -80,6 +80,8 @@ export const config = {
   },
   /** A second staff member must approve a HUF before it is sent to NSE. Only turn off for a one-person test setup. */
   hufSecondApprover: env('HUF_SECOND_APPROVER', 'true') !== 'false',
+  /** How often HUFs still waiting on NSE (bank check, registrars, the karta) are re-read. */
+  hufStatusIntervalMs: Number(env('HUF_STATUS_INTERVAL_MS', String(30 * 60_000))),
   /**
    * 32 bytes, base64: encrypts what a HUF registration needs in full (PANs, bank account, dates of birth, address).
    * Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"

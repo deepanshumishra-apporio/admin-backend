@@ -102,6 +102,11 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   loopback or private IP is refused, so a missing `TRUST_PROXY` can never put our own address on record.
 - **Retries**: approving again after a failure re-runs only the NSE steps that did not finish; the UCC is never
   re-sent. Once the UCC is in, the details are locked (a change would need a UCC modification, not built yet).
+- **Documents**: once registered, staff upload the karta's signed AOF (`fileupload/AOFIMG`, needed before a non-demat
+  order: a HUF can't have an eLog), the signed FATCA form (`FATCAIMG`) and, if the bank check fails, a cancelled
+  cheque (`CANCELCHEQUE`). PDF/JPG/PNG/TIFF up to 3 MB, checked by file signature, sent straight to NSE; only the
+  name, size and SHA-256 are kept. CAMS/KFin's AOF verdict comes from `AOF_IMAGE_UPLOAD_REPORT`.
+- **Status job**: every 30 min (`HUF_STATUS_INTERVAL_MS`) HUFs still waiting on NSE are re-read; none waiting, no calls.
 - **Active**: NSE's authorisation report is empty for HUFs, so staff mark a HUF active once an order is accepted.
 - **No eLog**: NSE's ELOG API is for individuals only.
 - **Tested**: `test/hufs.test.ts` against a fake NSE; and end to end on NSE UAT on 2 Nov 2026 through the dashboard

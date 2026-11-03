@@ -292,6 +292,8 @@ export type NseStatus = {
   fatca: { cams: RegistrarStatus; kfin: RegistrarStatus } | null;
   /** Null when unknown: NSE's CLIENT_AUTHORIZATION report returns no rows for HUFs, even active ones. */
   authorised: boolean | null;
+  /** The signed account-opening form at CAMS and KFin, from NSE's AOF upload report; null until one is uploaded. */
+  aof?: { cams: RegistrarStatus; kfin: RegistrarStatus; uploadedAt: string | null } | null;
   checkedAt: string;
 };
 
@@ -307,11 +309,15 @@ function fatcaTime(value: unknown): number {
 export async function readStatus(clientCode: string, pan: string): Promise<NseStatus> {
   const today = new Date(Date.now() + 5.5 * 3_600_000);
   const ddmmyyyy = (d: Date) => d.toISOString().slice(0, 10).split('-').reverse().join('-');
-  const [master, auth, fatca] = await Promise.all([
+  const [master, auth, fatca, aof] = await Promise.all([
     nsePost('reports/client_master_report', { client_code: clientCode, PAN: '', from_date: '', to_date: '' }),
     nsePost('reports/CLIENT_AUTHORIZATION', { from_date: ddmmyyyy(new Date(today.getTime() - 7 * 86_400_000)), to_date: ddmmyyyy(today), client_code: clientCode }),
     nsePost('reports/FATCA_REPORT', { pan_pkern_no: pan, from_date: '', to_date: '' }),
+    nsePost('reports/AOF_IMAGE_UPLOAD_REPORT', { client_code: clientCode, from_date: '', to_date: '' }),
   ]);
+  // "18/01/2025 11:58 AM": no seconds, unlike FATCA_REPORT's times.
+  const aofTime = (r: any) => fatcaTime(trim(r.created_at).replace(/(\d{2}:\d{2})( ?[AP]M)?$/i, '$1:00$2'));
+  const o = rows(aof).filter((r) => up(r.client_code) === clientCode).sort((x, y) => aofTime(y) - aofTime(x))[0];
   const mine = (list: any[]) => list.find((r) => up(r.client_code) === clientCode) ?? null;
   const m = mine(rows(master));
   const a = mine(rows(auth));
@@ -325,6 +331,43 @@ export async function readStatus(clientCode: string, pan: string): Promise<NseSt
       kfin: registrarStatus(f.kfinuploadstatus, f.kfinresponsestatus, f.kfinremarks),
     } : null,
     authorised: authStatus ? /SUCCESS|AUTHORI[SZ]E/i.test(authStatus) : null,
+    aof: o ? { cams: aofStatus(o.cams_status, o.cams_reason), kfin: aofStatus(o.kfin_status, o.kfin_reason), uploadedAt: trim(o.created_at) || null } : null,
     checkedAt: new Date().toISOString(),
   };
+}
+
+/** A registrar's verdict on an uploaded AOF, e.g. "Uploaded - Ready to invest". */
+function aofStatus(status: unknown, reason: unknown): RegistrarStatus {
+  const s = up(status);
+  const verdict = /REJECT|FAIL|INVALID|DISCREPAN/.test(s) ? 'REJECTED' : /READY|ACCEPT|SUCCESS|VERIFIED/.test(s) ? 'ACCEPTED' : !s ? 'NOT_SENT' : 'PENDING';
+  return { status: verdict, remark: trim(reason) || (verdict === 'PENDING' ? trim(status) : '') || null };
+}
+
+// --- documents -------------------------------------------------------------------------------
+// Scans of signed paper, sent to NSE as base64. NSE accepts jpg, jpeg, png, tif, tiff and pdf.
+// The AOF matters most: for a non-demat order NSE checks an eLog, AOF or FATCA is on file, and a HUF can't have an
+// eLog (that API is for individuals only).
+
+export const DocumentKinds = ['AOF', 'FATCA_FORM', 'CANCELLED_CHEQUE'] as const;
+export type DocumentKind = (typeof DocumentKinds)[number];
+export const DocumentTypes: Record<string, string> = {
+  'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png', 'image/tiff': 'tif',
+};
+
+const uploadResult = (body: any): NseResult => {
+  const status = trim(body?.status);
+  return { ok: status === '100', status: status || 'NO_RESPONSE', remark: trim(body?.message) || null };
+};
+
+/** Sends one signed document to NSE. `fileName` is at most 40 characters, as NSE allows. */
+export async function uploadDocument(kind: DocumentKind, d: HufDetails, fileName: string, base64: string): Promise<NseResult> {
+  const file_name = fileName.slice(-40);
+  if (kind === 'AOF') {
+    // NRM: a distributor's (normal) client; RIA is for an adviser's direct-plan clients.
+    return uploadResult(await nsePost('fileupload/AOFIMG', { client_code: d.clientCode, file_name, document_type: 'NRM', file_data: base64 }));
+  }
+  if (kind === 'FATCA_FORM') return uploadResult(await nsePost('fileupload/FATCAIMG', { file_name, pan_no: d.pan, file_data: base64 }));
+  return uploadResult(await nsePost('fileupload/CANCELCHEQUE', {
+    file_name, client_code: d.clientCode, account_no: d.accountNo, ifsc: d.ifsc, account_type: d.accountType, file_data: base64,
+  }));
 }

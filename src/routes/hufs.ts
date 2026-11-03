@@ -14,8 +14,9 @@ import { all, nowIso, one, run } from '../db.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
 import {
-  authorisationLink, clientCodesForPan, IncomeSlabs, readHuf, readStatus, registerUcc, resendAuthorisation, UccStates, uploadFatca,
-  type Consent, type HufDetails, type NseResult, type NseStatus,
+  authorisationLink, clientCodesForPan, DocumentKinds, DocumentTypes, IncomeSlabs, readHuf, readStatus, registerUcc, resendAuthorisation,
+  UccStates, uploadDocument, uploadFatca,
+  type Consent, type DocumentKind, type HufDetails, type NseResult, type NseStatus,
 } from '../nse/huf.ts';
 import { newId, seal, unseal } from '../security.ts';
 
@@ -32,6 +33,20 @@ type Row = {
   consent_token_hash: string | null; consent_expires_at: string | null; consent_ip: string | null; consent_at: string | null;
   consent_user_agent: string | null; steps: string; nse_status: string | null; auth_link: string | null; auth_link_error: string | null;
   last_error: string | null; created_by: string; approved_by: string | null; approved_at: string | null; created_at: string; updated_at: string;
+  documents: string | null;
+};
+
+/** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
+type DocumentRecord = NseResult & { fileName: string; contentType: string; bytes: number; sha256: string; uploadedAt: string; uploadedBy: string };
+type Documents = Partial<Record<DocumentKind, DocumentRecord>>;
+const documentsOf = (r: Row): Documents => (r.documents ? (JSON.parse(r.documents) as Documents) : {});
+const MaxDocumentBytes = 3 * 1024 * 1024;
+/** What each accepted file type starts with, so a renamed file of another type is refused. */
+const Signatures: Record<string, (b: Buffer) => boolean> = {
+  pdf: (b) => b.subarray(0, 4).toString('latin1') === '%PDF',
+  jpg: (b) => b[0] === 0xff && b[1] === 0xd8,
+  png: (b) => b.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])),
+  tif: (b) => ['49492a00', '4d4d002a'].includes(b.subarray(0, 4).toString('hex')),
 };
 
 /** Loopback and private-network addresses: never a karta's own address on the internet. */
@@ -88,6 +103,15 @@ function problems(r: Row, nse: NseStatus | null): string[] {
   for (const [name, s] of Object.entries(nse?.fatca ?? {})) {
     if (s.status === 'REJECTED') out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the FATCA declaration${s.remark ? `: ${s.remark}` : ''}.`);
   }
+  const docs = documentsOf(r);
+  if ((r.status === 'AWAITING_KARTA' || r.status === 'ACTIVE') && !docs.AOF?.ok) {
+    out.push("Upload the AOF signed by the karta. For a non-demat order NSE checks an eLog or AOF is on file, and a HUF can't have an eLog.");
+  }
+  for (const [name, s] of Object.entries(nse?.aof ?? {})) {
+    if (typeof s === 'object' && s && 'status' in s && s.status === 'REJECTED') {
+      out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the AOF${s.remark ? `: ${s.remark}` : ''}. Upload a corrected one.`);
+    }
+  }
   return out;
 }
 
@@ -109,6 +133,8 @@ async function detail(id: string, ctx: Ctx) {
     nse,
     authLink: r.auth_link,
     authLinkError: r.auth_link_error,
+    documents: documentsOf(r),
+    canUploadDocuments: registered && r.status !== 'CANCELLED',
     lastError: r.last_error,
     problems: problems(r, nse),
     approvedAt: r.approved_at,
@@ -210,6 +236,41 @@ async function fetchLink(id: string, clientCode: string): Promise<void> {
     if (!(error instanceof NseError)) throw error;
     await run('UPDATE hufs SET auth_link_error = ? WHERE id = ?', error.message, id);
   }
+}
+
+/** Reads a registered HUF's status from NSE and saves it; NSE reporting the karta's authorisation makes it active. */
+async function refreshOne(r: Row): Promise<void> {
+  const d = unseal<HufDetails>(r.details);
+  const status = await readStatus(d.clientCode, d.pan);
+  const next: Status = status.authorised ? 'ACTIVE' : r.status;
+  await run('UPDATE hufs SET nse_status = ?, status = ?, updated_at = ? WHERE id = ?', JSON.stringify(status), next, nowIso(), r.id);
+  if (next === 'ACTIVE' && r.status !== 'ACTIVE') await event(r.id, 'ACTIVE', null, 'NSE reports the karta has authorised the account.');
+  if (stepsOf(r).fatca?.ok && !r.auth_link) await fetchLink(r.id, d.clientCode);
+}
+
+/** Whether a HUF still has something on NSE's side to wait for: the bank check, a registrar, or the AOF. */
+function stillWaiting(r: Row): boolean {
+  if (r.status === 'AWAITING_KARTA') return true;
+  if (r.status !== 'ACTIVE') return false;
+  const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
+  const settled = (s: { status: string } | undefined) => s?.status === 'ACCEPTED' || s?.status === 'REJECTED';
+  return !nse || nse.bankStatus?.toUpperCase() === 'PENDING' || !settled(nse.fatca?.kfin) || !settled(nse.fatca?.cams) ||
+    (Boolean(documentsOf(r).AOF?.ok) && (!settled(nse.aof?.kfin) || !settled(nse.aof?.cams)));
+}
+
+/**
+ * Every 30 min, re-reads the HUFs still waiting on NSE (bank check, registrars, the karta), so staff don't have to
+ * press Refresh. Nothing is read, and the database isn't touched, when no HUF is waiting.
+ */
+export function startHufStatusLoop(): void {
+  const tick = async () => {
+    if (!nseConfigured() || (nseIsLive() && !config.nse.allowProd)) return;
+    const waiting = (await all<Row>("SELECT * FROM hufs WHERE status IN ('AWAITING_KARTA', 'ACTIVE')")).filter(stillWaiting);
+    for (const r of waiting) {
+      await refreshOne(r).catch((error) => console.error(`[hufs] refresh ${r.client_code} failed:`, (error as Error).message));
+    }
+  };
+  setInterval(() => void tick().catch((error) => console.error('[hufs] status loop failed:', (error as Error).message)), config.hufStatusIntervalMs).unref();
 }
 
 // --- the karta's consent page (public) ------------------------------------------------------------------------
@@ -341,18 +402,55 @@ export function hufRoutes(router: Router): void {
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
     if (!r) throw HttpError.notFound('That HUF could not be found.');
     if (!onNse(r)) throw HttpError.conflict('This HUF is not on NSE yet.');
-    const d = unseal<HufDetails>(r.details);
-    let status: NseStatus;
     try {
-      status = await readStatus(d.clientCode, d.pan);
+      await refreshOne(r);
     } catch (error) {
       if (error instanceof NseError) throw new HttpError(502, 'NSE_UNAVAILABLE', `Couldn't read from NSE: ${error.message}`);
       throw error;
     }
-    const next: Status = status.authorised ? 'ACTIVE' : r.status;
-    await run('UPDATE hufs SET nse_status = ?, status = ?, updated_at = ? WHERE id = ?', JSON.stringify(status), next, nowIso(), id);
-    if (next === 'ACTIVE' && r.status !== 'ACTIVE') await event(id, 'ACTIVE', null, 'NSE reports the karta has authorised the account.');
-    if (stepsOf(r).fatca?.ok && !r.auth_link) await fetchLink(id, d.clientCode);
+    return detail(id, ctx);
+  });
+
+  /**
+   * A signed document, sent to NSE as it is: the AOF (needed before the HUF can invest), the FATCA form, or a
+   * cancelled cheque of the HUF's account (when NSE's bank check fails). Only its name, size and fingerprint are kept.
+   */
+  router.post('/hufs/:id/documents', full, manage, async (ctx) => {
+    const id = uuidParam(ctx, 'id');
+    const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
+    if (!r) throw HttpError.notFound('That HUF could not be found.');
+    if (!onNse(r) || r.status === 'CANCELLED') throw HttpError.conflict('Documents go to NSE once the HUF is registered there.');
+    const kind = ctx.body?.kind as DocumentKind;
+    if (!(DocumentKinds as readonly string[]).includes(kind)) throw HttpError.badRequest('Choose which document this is.');
+    const contentType = String(ctx.body?.contentType ?? '');
+    const ext = DocumentTypes[contentType];
+    if (!ext) throw HttpError.badRequest('Upload a PDF, JPG, PNG or TIFF.');
+    const data = typeof ctx.body?.data === 'string' ? ctx.body.data : '';
+    const file = Buffer.from(data, 'base64');
+    if (!file.length) throw HttpError.badRequest('The file is empty.');
+    if (file.length > MaxDocumentBytes) throw HttpError.badRequest('The file is over 3 MB. Scan it at a lower resolution, or as a PDF.');
+    if (!Signatures[ext]!(file)) throw HttpError.badRequest(`That file is not really a ${ext.toUpperCase()}.`);
+    const d = unseal<HufDetails>(r.details);
+    // NSE allows 40 characters; the client code and kind make the name findable on NSE's side.
+    const fileName = `${d.clientCode}_${kind}_${Date.now()}.${ext}`;
+    let result: NseResult;
+    try {
+      result = await uploadDocument(kind, d, fileName, file.toString('base64'));
+    } catch (error) {
+      if (error instanceof NseError) throw new HttpError(502, 'NSE_UNAVAILABLE', `Couldn't reach NSE: ${error.message}`);
+      throw error;
+    }
+    const record: DocumentRecord = {
+      ...result, fileName, contentType, bytes: file.length, sha256: createHash('sha256').update(file).digest('hex'),
+      uploadedAt: nowIso(), uploadedBy: ctx.staff!.id,
+    };
+    // A failed attempt is recorded too, but never replaces a copy NSE already accepted.
+    const docs = documentsOf(r);
+    if (result.ok || !docs[kind]?.ok) docs[kind] = record;
+    await run('UPDATE hufs SET documents = ?, updated_at = ? WHERE id = ?', JSON.stringify(docs), nowIso(), id);
+    await event(id, result.ok ? `${kind}_UPLOADED` : `${kind}_FAILED`, ctx.staff!.id, result.remark);
+    await audit(ctx, 'huf.document', id, { kind, ok: result.ok, bytes: file.length, sha256: record.sha256 });
+    if (!result.ok) throw HttpError.conflict(`NSE did not accept it: ${result.remark ?? result.status}.`);
     return detail(id, ctx);
   });
 
