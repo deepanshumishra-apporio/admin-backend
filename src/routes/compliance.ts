@@ -8,7 +8,7 @@ import { snapshot, type Snapshot } from '../investors.ts';
 import { fatcaRejection, flagOf, isOrder, isPlan, ms, money0, supportInvestor, type Facts } from '../map.ts';
 import { notify } from '../notifications.ts';
 import { newId, uuidFor } from '../security.ts';
-import { investorDetail, mapLimit } from '../upstream.ts';
+import { investorDetail, mapLimit, upstream, type UpFreshness } from '../upstream.ts';
 
 export const Kinds = [
   'KYC_STALLED', 'KYC_FAILED', 'SIP_FAILURES', 'MANDATE_REJECTED', 'MANDATE_PENDING', 'PAID_NOT_ALLOTTED', 'ORDER_STUCK', 'NOMINEE_MISSING',
@@ -48,14 +48,12 @@ export const KindLabels: Record<Kind, string> = {
  * empty list isn't read as a clean one.
  */
 export const NotChecked: { kind: Kind; needs: string }[] = [
-  { kind: 'REDEMPTION_PAYOUT_PENDING', needs: "the redemption's payout date or UTR" },
-  { kind: 'CONSENT_MISSING', needs: "each order's SEBI 2FA consent" },
-  { kind: 'KYC_NOT_COMPLIANT', needs: "the investor's latest KRA status (on hold, rejected, re-KYC due)" },
-  { kind: 'PEP_INVESTOR', needs: 'a politically-exposed flag from onboarding' },
-  { kind: 'MONITORING_STALE', needs: 'a last-updated time for the app data' },
+  { kind: 'REDEMPTION_PAYOUT_PENDING', needs: 'a payout date or UTR, which FP doesn’t give (only when the units were redeemed)' },
+  { kind: 'KYC_NOT_COMPLIANT', needs: 'a periodic KRA re-check after onboarding (the app checks the KRA only during onboarding)' },
+  { kind: 'PEP_INVESTOR', needs: 'a PEP question in onboarding (the app sends “not applicable” to FP for everyone)' },
 ];
-/** Checked for HUFs onboarded here only: the Admin API sends no mandates for investors. */
-export const HufOnly: Kind[] = ['MANDATE_REJECTED', 'MANDATE_PENDING', 'AOF_MISSING'];
+/** Checked for HUFs onboarded here only. */
+export const HufOnly: Kind[] = ['AOF_MISSING'];
 
 type Detection = {
   kind: Kind;
@@ -74,6 +72,8 @@ const LargeAmount = Number(process.env['LARGE_TRANSACTION_AMOUNT'] ?? 500_000);
 const DeepEveryMs = 6 * HourMs;
 const DeepKinds = new Set<Kind>(['KYC_FAILED', 'NOMINEE_MISSING', 'PAYOUT_BANK_UNVERIFIED', 'COMPLAINT_OVERDUE', 'FATCA_REJECTED']);
 const SystemActor = 'system:compliance-scan';
+/** The app has recorded each transaction's 2FA OTP since this day (commit 8175005); older orders have none. */
+const ConsentSince = Date.parse('2026-10-01T00:00:00Z');
 
 const scheme = (o: { fund?: { name: string } | null; isin: string }) => o.fund?.name ?? o.isin;
 
@@ -129,6 +129,19 @@ function lightDetections(snap: Snapshot): Detection[] {
     }
   }
 
+  // SEBI 2FA: every order and plan past review needs the investor's OTP. The app has recorded it since 2026-09-30, and
+  // an older app backend sends no `consent` field at all, so neither is flagged.
+  for (const o of snap.orders) {
+    if (!('consent' in o) || o.consent || ms(o.created_at) < ConsentSince) continue;
+    const pastReview = isPlan(o) ? !['cancelled', 'failed', 'created'].includes(o.state) : ['confirmed', 'submitted', 'successful'].includes(o.state);
+    if (!pastReview) continue;
+    const plan = isPlan(o);
+    found.push({ kind: 'CONSENT_MISSING', severity: 'HIGH', dedupeKey: `consent_missing:${o.id}`, userExtId: String(o.user_id),
+      entity: plan ? { type: 'plan', id: uuidFor('plan', o.id) } : { type: 'order', id: uuidFor('order', o.id) },
+      title: `No 2FA consent on ${o.kind === 'sip' ? 'a SIP' : `a ${o.kind}`} of ₹${money0(o.amount)}`,
+      detail: `${o.ref ?? o.id} in ${scheme(o)} is "${o.status ?? o.state}" but the app has no OTP consent recorded for it. SEBI requires one for every transaction.` });
+  }
+
   for (const p of snap.orders.filter(isPlan)) {
     const failed = (p.installments ?? []).filter((i) => i['state'] === 'failed').length;
     if (p.kind === 'sip' && (failed >= 2 || p['first_payment_failed'])) {
@@ -177,6 +190,24 @@ async function deepDetections(snap: Snapshot): Promise<Detection[]> {
     } else if (d.onboarded_at && d.bank && !d.bank.verified) {
       found.push({ kind: 'PAYOUT_BANK_UNVERIFIED', severity: 'MEDIUM', dedupeKey: `bank_unverified:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
         title: 'Payout bank account not verified', detail: `Redemptions pay out to ${d.bank.bank_name ?? 'a bank'} ${d.bank.account_masked}, which is not verified.` });
+    }
+    // AutoPay: a mandate the bank rejected, or one left unauthorised while a SIP waits on it.
+    const m = d.mandate;
+    const liveSip = resp.sips.some((s) => !['cancelled', 'completed', 'failed'].includes(s.state));
+    if (m && /REJECT|FAIL/i.test(m.status ?? '')) {
+      found.push({ kind: 'MANDATE_REJECTED', severity: liveSip ? 'HIGH' : 'MEDIUM', dedupeKey: `mandate_rejected:${m.id}`, userExtId,
+        entity: { type: 'account', id: f.id }, title: `AutoPay mandate ${m.status?.toLowerCase()}`,
+        detail: `The ${m.type ?? ''} mandate${m.limit ? ` (up to ₹${money0(m.limit)})` : ''} was ${m.status?.toLowerCase()} by the bank.${liveSip ? ' The investor has a live SIP that can’t debit until they set up AutoPay again.' : ''}` });
+    } else if (m && /CREATED|SUBMITTED|PENDING/i.test(m.status ?? '') && liveSip && m.created_at && Date.now() - ms(m.created_at) > 3 * DayMs) {
+      found.push({ kind: 'MANDATE_PENDING', severity: 'MEDIUM', dedupeKey: `mandate_pending:${m.id}`, userExtId,
+        entity: { type: 'account', id: f.id }, title: 'AutoPay not authorised for 3 days',
+        detail: `The mandate is still "${m.status}" while the investor has a SIP that depends on it. They need to finish authorising it with their bank.` });
+    }
+    // A fresh KYC (a PAN the KRA had no KYC for) that Cybrilla POA failed or that expired: the investor can't invest.
+    const form = d.kyc?.form_status;
+    if (d.kyc?.fresh && (form === 'failed' || form === 'expired')) {
+      found.push({ kind: 'KYC_FAILED', severity: 'HIGH', dedupeKey: `kyc_form:${userExtId}`, userExtId, entity: { type: 'account', id: f.id },
+        title: `Fresh KYC ${form}`, detail: `The investor's new KYC application ${form === 'failed' ? `failed${d.kyc.form_reason ? `: "${d.kyc.form_reason}"` : ''}` : 'expired before it was completed'}. They can't invest until they redo it in the app.` });
     }
     const fatca = fatcaRejection(d);
     if (fatca) {
@@ -250,6 +281,27 @@ export async function hufDetections(): Promise<Detection[]> {
   return found;
 }
 
+/**
+ * The app's background jobs, from its /summary: a job with no success in three of its intervals means the data the
+ * other checks read (KYC approvals, SIP first payments, NAVs) has stopped moving. An older app backend sends no
+ * freshness, and then nothing is raised.
+ */
+export function monitoringDetections(f: UpFreshness | undefined, now = Date.now()): Detection[] {
+  if (!f?.started_at) return [];
+  const found: Detection[] = [];
+  for (const j of f.jobs) {
+    const window = 3 * j.every_ms + 10 * 60_000;
+    if (now - Date.parse(f.started_at) < window) continue;
+    const lastOk = j.last_ok_at ? Date.parse(j.last_ok_at) : null;
+    if (lastOk !== null && now - lastOk < window) continue;
+    const failing = j.last_error_at && (!lastOk || Date.parse(j.last_error_at) > lastOk);
+    found.push({ kind: 'MONITORING_STALE', severity: j.name === 'sip-first-payments' ? 'HIGH' : 'MEDIUM', dedupeKey: `monitoring:${j.name}`, userExtId: null, entity: null,
+      title: `The app's ${j.name} job ${failing ? 'keeps failing' : 'has stopped'}`,
+      detail: `It should run every ${Math.round(j.every_ms / 60_000)} min and last succeeded ${j.last_ok_at ?? 'never (since the app restarted)'}.${failing ? ` Its last failure was ${j.last_error_at}.` : ''} Ask Akash to check the app backend's log.` });
+  }
+  return found;
+}
+
 let scanning: Promise<unknown> | null = null;
 // What the last scan that wrote to the database found. A timer scan that finds exactly the same doesn't touch the
 // database at all, so Neon's compute can sleep; the 6-hourly deep scan always writes.
@@ -266,7 +318,8 @@ export async function scan(deepRequested: boolean) {
     }
     const deep = deepRequested || Date.now() - lastDeepAt > DeepEveryMs;
     const snap = await snapshot(SystemActor, { fresh: true });
-    const detections = [...lightDetections(snap), ...(await hufDetections()), ...(deep ? await deepDetections(snap) : [])];
+    const freshness = await upstream<{ freshness?: UpFreshness }>('/summary', SystemActor).then((s) => s.freshness).catch(() => undefined);
+    const detections = [...lightDetections(snap), ...(await hufDetections()), ...monitoringDetections(freshness), ...(deep ? await deepDetections(snap) : [])];
     const at = nowIso();
     const unique = [...new Map(detections.map((d) => [d.dedupeKey, d])).values()];
     const fingerprint = JSON.stringify(unique.map((d) => [d.dedupeKey, d.severity, d.title, d.detail]).sort());

@@ -74,6 +74,26 @@ export type UpInvestorDetail = UpInvestor & {
   deletion?: Record<string, unknown> | null;
   huf?: UpHuf | null;
   nse?: UpNse | null;
+  /** The AutoPay mandate as the app last read it from FP. Absent from an older app backend. */
+  mandate?: UpMandate | null;
+  /** A fresh KYC (a PAN the KRA had no KYC for). Absent from an older app backend. */
+  kyc?: UpKyc;
+};
+
+export type UpMandate = {
+  id: string; status: string | null; type: string | null; limit: number | null; umrn_masked: string | null;
+  valid_from: string | null; valid_to: string | null; created_at: string | null;
+};
+
+export type UpKyc = {
+  fresh: boolean; form_status: string | null; form_reason: string | null; submitted_at: string | null; expires_at: string | null;
+  kra_checked_at: string | null; kra_approved_at: string | null;
+};
+
+/** GET /summary's freshness: when the app's data last moved. Webhook and job times are since its process started. */
+export type UpFreshness = {
+  last_order_update_at: string | null; last_webhook_at: string | null; started_at: string | null;
+  jobs: { name: string; every_ms: number; last_ok_at: string | null; last_error_at: string | null }[];
 };
 
 /** An order or a plan (the Admin API lists both under /orders; `kind` tells them apart). */
@@ -119,6 +139,8 @@ export type UpOrder = {
   installments?: Record<string, unknown>[];
   reason?: string | null;
   mandate_id?: string | number | null;
+  /** The investor's 2FA OTP for this order: when and how. Null when none was recorded; absent from an older app backend. */
+  consent?: { at: string; via: string } | null;
   [key: string]: unknown;
 };
 
