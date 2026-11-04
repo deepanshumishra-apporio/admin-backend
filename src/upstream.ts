@@ -139,8 +139,9 @@ export type UpHolding = {
 };
 
 export type UpPortfolio = {
-  summary: { current: number; invested: number; gain: number; gain_pct: number | null; xirr?: number | null };
-  holdings: UpHolding[];
+  /** Missing for an investor who has never invested (a new sign-up). */
+  summary?: { current: number; invested: number; gain: number; gain_pct: number | null; xirr?: number | null };
+  holdings?: UpHolding[];
 };
 
 type UpList<T> = { total: number; limit: number; offset: number; data: T[] };

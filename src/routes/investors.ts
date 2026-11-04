@@ -272,7 +272,7 @@ export function investorRoutes(router: Router): void {
 
     if (type === 'holding') {
       const port = await portfolio(extId, actor);
-      const h = port.holdings.find((x) => uuidFor('holding', holdingKey(extId, x)) === itemId);
+      const h = (port.holdings ?? []).find((x) => uuidFor('holding', holdingKey(extId, x)) === itemId);
       if (!h) throw HttpError.notFound('That holding could not be found.');
       const related = resp.orders.filter((o) => o.isin === h.isin && (!o.folio || o.folio === h.folio));
       return {

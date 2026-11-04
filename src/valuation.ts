@@ -19,7 +19,7 @@ async function refresh(): Promise<void> {
   await mapLimit(targets, 3, async (investor) => {
     try {
       const p = await portfolio(investor.id, SystemActor);
-      next.set(investor.id, Number(p.summary.current ?? 0));
+      next.set(investor.id, Number(p.summary?.current ?? 0));
     } catch (error) {
       const previous = values.get(investor.id);
       if (previous !== undefined) next.set(investor.id, previous);

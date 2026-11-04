@@ -128,6 +128,14 @@ test('a HUF: account type, its onboarding steps, the karta link, no nominee, FAT
   assert.equal(investorDetail({ investor: { ...up, account_type: undefined }, orders: [], sips: [], stps: [], swps: [] }, null, new Map()).huf, null);
 });
 
+test("a new sign-up: the app's portfolio has no summary or holdings yet, and the record still opens", () => {
+  const investor = { id: 9, name: 'New User', email: 'n@x.in', mobile: '9', stage: 'signup', kyc_compliant: false, pan_masked: null,
+    signed_up_at: '2026-11-04 06:10:00', onboarded_at: null, orders: 0, plans: 0 };
+  const detail = investorDetail({ investor, orders: [], sips: [], stps: [], swps: [] }, {} as never, new Map());
+  assert.equal(detail.summary.accountType, 'INDIVIDUAL');
+  assert.equal(detail.summary.stage, 'SIGNED_UP');
+});
+
 test('CSV escapes quotes and neutralises formulas', () => {
   const csv = toCsv([{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], [{ a: '=HYPERLINK("x")', b: -12.5 }]);
   assert.equal(csv, '﻿A,B\r\n"\'=HYPERLINK(""x"")",-12.5\r\n');

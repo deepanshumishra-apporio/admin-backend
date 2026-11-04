@@ -626,8 +626,8 @@ export function investments(userId: number, orders: UpOrder[], plans: UpOrder[],
   const onNext = active.filter((p) => iso(p.next_debit ?? p.next_installment_date) === nextDate);
   const sum = (list: UpOrder[], kind: string) =>
     list.filter((o) => o.kind === kind && o.state === 'successful').reduce((s, o) => s + Number(o.amount ?? 0), 0);
-  const current = port?.summary.current ?? 0;
-  const investedValue = port?.summary.invested ?? 0;
+  const current = port?.summary?.current ?? 0;
+  const investedValue = port?.summary?.invested ?? 0;
   const asOf = (port?.holdings ?? []).map((h) => h.nav_date).filter((d): d is string => !!d).sort().at(-1) ?? null;
   return {
     portfolio: {
@@ -738,7 +738,7 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
   const up = resp.investor;
   const checks = up.checks ?? {};
   const plans = [...(resp.sips ?? []), ...(resp.stps ?? []), ...(resp.swps ?? [])];
-  const facts = factsFor(up, [...resp.orders, ...plans], port ? new Map([[up.id, port.summary.current]]) : values, checks);
+  const facts = factsFor(up, [...resp.orders, ...plans], port?.summary ? new Map([[up.id, port.summary.current]]) : values, checks);
   const nominee = up.nominee;
   const huf = facts.accountType === 'HUF';
   return {
