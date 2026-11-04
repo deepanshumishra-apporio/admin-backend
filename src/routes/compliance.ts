@@ -13,7 +13,7 @@ import { investorDetail, mapLimit } from '../upstream.ts';
 export const Kinds = [
   'KYC_STALLED', 'KYC_FAILED', 'SIP_FAILURES', 'MANDATE_REJECTED', 'MANDATE_PENDING', 'PAID_NOT_ALLOTTED', 'ORDER_STUCK', 'NOMINEE_MISSING',
   'REDEMPTION_PAYOUT_PENDING', 'REFUND_PENDING', 'CONSENT_MISSING', 'KYC_NOT_COMPLIANT', 'PEP_INVESTOR', 'LARGE_TRANSACTION', 'RAPID_ROUND_TRIP',
-  'COMPLAINT_OVERDUE', 'PAYOUT_BANK_UNVERIFIED', 'CONTACT_MISSING', 'MONITORING_STALE', 'FATCA_REJECTED',
+  'COMPLAINT_OVERDUE', 'PAYOUT_BANK_UNVERIFIED', 'CONTACT_MISSING', 'MONITORING_STALE', 'FATCA_REJECTED', 'AOF_MISSING',
 ] as const;
 type Kind = (typeof Kinds)[number];
 const Severities = ['HIGH', 'MEDIUM', 'LOW'] as const;
@@ -40,14 +40,29 @@ export const KindLabels: Record<Kind, string> = {
   CONTACT_MISSING: 'Contact details missing',
   MONITORING_STALE: 'Monitoring data stale',
   FATCA_REJECTED: 'FATCA rejected by the registrar',
+  AOF_MISSING: 'AOF not with the registrars',
 };
+
+/**
+ * Kinds no check raises yet, because the Admin API doesn't send what they need. The Compliance page says so, so an
+ * empty list isn't read as a clean one.
+ */
+export const NotChecked: { kind: Kind; needs: string }[] = [
+  { kind: 'REDEMPTION_PAYOUT_PENDING', needs: "the redemption's payout date or UTR" },
+  { kind: 'CONSENT_MISSING', needs: "each order's SEBI 2FA consent" },
+  { kind: 'KYC_NOT_COMPLIANT', needs: "the investor's latest KRA status (on hold, rejected, re-KYC due)" },
+  { kind: 'PEP_INVESTOR', needs: 'a politically-exposed flag from onboarding' },
+  { kind: 'MONITORING_STALE', needs: 'a last-updated time for the app data' },
+];
+/** Checked for HUFs onboarded here only: the Admin API sends no mandates for investors. */
+export const HufOnly: Kind[] = ['MANDATE_REJECTED', 'MANDATE_PENDING', 'AOF_MISSING'];
 
 type Detection = {
   kind: Kind;
   severity: (typeof Severities)[number];
   dedupeKey: string;
   userExtId: string | null;
-  entity: { type: 'order' | 'plan' | 'mandate' | 'account' | 'ticket'; id: string } | null;
+  entity: { type: 'order' | 'plan' | 'mandate' | 'account' | 'ticket' | 'huf'; id: string } | null;
   title: string;
   detail: string;
 };
@@ -174,6 +189,67 @@ async function deepDetections(snap: Snapshot): Promise<Detection[]> {
   return found;
 }
 
+type HufScanRow = { id: string; huf_name: string; client_code: string; nse_status: string | null; documents: string | null; investments: string | null };
+type Registrar = { status: string; remark?: string | null };
+
+/** "03/11/2026", "2026-11-03" or "03-11-2026 10:15" as a time; NaN when it isn't a date. */
+const dateMs = (v: string | null | undefined) => {
+  const s = String(v ?? '').trim();
+  const dmy = s.match(/^(\d{2})[/-](\d{2})[/-](\d{4})/);
+  return Date.parse(dmy ? `${dmy[3]}-${dmy[2]}-${dmy[1]}T00:00:00Z` : s);
+};
+
+/**
+ * HUFs onboarded through this admin, from what NSE last told the HUF status and investments jobs: FATCA or the AOF
+ * rejected by a registrar, the bank check failed, the AOF never sent, and the HUF's eNACH mandates. These live in
+ * the admin database (the Admin API has no HUF fields yet), so every scan reads them; it's one query.
+ */
+export async function hufDetections(): Promise<Detection[]> {
+  const found: Detection[] = [];
+  const rows = await all<HufScanRow>("SELECT id, huf_name, client_code, nse_status, documents, investments FROM hufs WHERE status IN ('AWAITING_KARTA', 'ACTIVE')");
+  for (const h of rows) {
+    const nse = h.nse_status ? (JSON.parse(h.nse_status) as { bankStatus?: string | null; bankRemark?: string | null; fatca?: { cams: Registrar; kfin: Registrar } | null; aof?: { cams: Registrar; kfin: Registrar } | null }) : null;
+    const entity = { type: 'huf' as const, id: h.id };
+    const who = `${h.huf_name} (${h.client_code})`;
+    const rejected = (pair: { cams: Registrar; kfin: Registrar } | null | undefined) =>
+      ([['CAMS', pair?.cams], ['KFin', pair?.kfin]] as const).filter(([, r]) => r?.status === 'REJECTED').map(([name, r]) => `${name}${r?.remark ? `: "${r.remark}"` : ''}`);
+
+    const fatca = rejected(nse?.fatca);
+    if (fatca.length) {
+      const ubo = fatca.some((f) => /UBO/i.test(f)) ? ' Re-send FATCA with the karta as beneficial owner (ubo_appl Y).' : '';
+      found.push({ kind: 'FATCA_REJECTED', severity: 'HIGH', dedupeKey: `huf_fatca_rejected:${h.id}`, userExtId: null, entity,
+        title: `FATCA rejected for ${h.huf_name}`, detail: `${who}: rejected by ${fatca.join('; ')}. NSE refuses its orders until FATCA is accepted.${ubo}` });
+    }
+    const bank = nse?.bankStatus?.toUpperCase();
+    if (bank && bank !== 'ACTIVE' && bank !== 'PENDING') {
+      found.push({ kind: 'PAYOUT_BANK_UNVERIFIED', severity: 'HIGH', dedupeKey: `huf_bank:${h.id}`, userExtId: null, entity,
+        title: `NSE rejected ${h.huf_name}'s bank account`,
+        detail: `${who}: NSE's bank check came back "${nse!.bankStatus}"${nse!.bankRemark ? `: ${nse!.bankRemark}` : ''}. The account must be the HUF's own, in its name. Upload a cancelled cheque or fix it with a UCC modification.` });
+    }
+    const aofRejected = rejected(nse?.aof);
+    const aofAccepted = [nse?.aof?.cams?.status, nse?.aof?.kfin?.status].includes('ACCEPTED');
+    const aofUploaded = Boolean((h.documents ? (JSON.parse(h.documents) as Record<string, { ok?: boolean }>) : {})['AOF']?.ok) || Boolean(nse?.aof);
+    if (aofRejected.length && !aofAccepted) {
+      found.push({ kind: 'AOF_MISSING', severity: 'HIGH', dedupeKey: `huf_aof:${h.id}`, userExtId: null, entity,
+        title: `AOF rejected for ${h.huf_name}`, detail: `${who}: the signed account-opening form was rejected by ${aofRejected.join('; ')}. Upload a corrected one; NSE refuses orders without it.` });
+    } else if (!aofUploaded) {
+      found.push({ kind: 'AOF_MISSING', severity: 'MEDIUM', dedupeKey: `huf_aof:${h.id}`, userExtId: null, entity,
+        title: `No AOF sent for ${h.huf_name}`, detail: `${who}: NSE has no signed account-opening form for this HUF, so it can't invest. Upload the AOF signed by the karta.` });
+    }
+    const mandates = h.investments ? ((JSON.parse(h.investments) as { mandates?: { mandateId: string; status: string; amount: number | null; registeredOn: string | null; remark: string | null }[] }).mandates ?? []) : [];
+    for (const m of mandates) {
+      if (/REJECT|FAIL/.test(m.status)) {
+        found.push({ kind: 'MANDATE_REJECTED', severity: 'HIGH', dedupeKey: `huf_mandate:${m.mandateId}`, userExtId: null, entity,
+          title: `Mandate rejected for ${h.huf_name}`, detail: `${who}: mandate ${m.mandateId} (up to ₹${money0(m.amount ?? 0)}) was ${m.status.toLowerCase()}${m.remark ? `: ${m.remark}` : ''}. Its SIPs can't debit; register another.` });
+      } else if (!/APPROVED|CANCEL/.test(m.status) && Date.now() - dateMs(m.registeredOn) > 3 * DayMs) {
+        found.push({ kind: 'MANDATE_PENDING', severity: 'MEDIUM', dedupeKey: `huf_mandate:${m.mandateId}`, userExtId: null, entity,
+          title: `Mandate not approved for ${h.huf_name}`, detail: `${who}: mandate ${m.mandateId} has waited over 3 days ("${m.status}"). The karta has to approve it with their bank on NSE's link.` });
+      }
+    }
+  }
+  return found;
+}
+
 let scanning: Promise<unknown> | null = null;
 // What the last scan that wrote to the database found. A timer scan that finds exactly the same doesn't touch the
 // database at all, so Neon's compute can sleep; the 6-hourly deep scan always writes.
@@ -190,7 +266,7 @@ export async function scan(deepRequested: boolean) {
     }
     const deep = deepRequested || Date.now() - lastDeepAt > DeepEveryMs;
     const snap = await snapshot(SystemActor, { fresh: true });
-    const detections = [...lightDetections(snap), ...(deep ? await deepDetections(snap) : [])];
+    const detections = [...lightDetections(snap), ...(await hufDetections()), ...(deep ? await deepDetections(snap) : [])];
     const at = nowIso();
     const unique = [...new Map(detections.map((d) => [d.dedupeKey, d])).values()];
     const fingerprint = JSON.stringify(unique.map((d) => [d.dedupeKey, d.severity, d.title, d.detail]).sort());
@@ -299,6 +375,8 @@ async function summary(rows: AlertRow[]) {
     ageingOver7Days: open.filter((a) => Date.now() - Date.parse(a.first_detected_at) > 7 * DayMs).length,
     unassigned: open.filter((a) => !a.assignee_id).length,
     byKind,
+    notChecked: NotChecked.map((n) => ({ key: n.kind, label: KindLabels[n.kind], needs: n.needs })),
+    hufOnly: HufOnly,
     resolvedLast30Days: closed.length,
     medianHoursToClose: median === null ? null : Math.round(median * 10) / 10,
     // A scan that found nothing new doesn't write, so this process may know of a later one.

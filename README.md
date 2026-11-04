@@ -126,6 +126,7 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   and refused until NSE's bank check has passed and the AOF is on NSE. NSE asks the karta to confirm every one, so
   staff can start but never complete an investment. Orders carry `NSE_EUIN` (`NSE_SUB_BROKER_ARN` if set).
 - **No eLog**: NSE's ELOG API is for individuals only.
+- **Compliance**: every scan also checks the HUFs here (`hufDetections` in [src/routes/compliance.ts](src/routes/compliance.ts)) from what NSE last reported: FATCA or the AOF rejected by a registrar, no AOF sent, the bank check failed, and eNACH mandates rejected or unapproved for 3 days. Kinds no check can raise yet (`NotChecked`) are listed on the Compliance page with the app data each needs.
 - **Tested**: `test/hufs.test.ts` against a fake NSE; and end to end on NSE UAT on 2 Nov 2026 through the dashboard
   (UCC and FATCA with the karta as UBO accepted, client `HUFT582104`). Not yet proven: KFin accepting that FATCA
   (UAT never forwards it), and the `ubo_code` (`NSE_HUF_UBO_CODE`, default `C01`).

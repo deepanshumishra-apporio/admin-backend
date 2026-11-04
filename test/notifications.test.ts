@@ -109,3 +109,32 @@ test('HUF changes: events, a FATCA rejection, units allotted, a SIP live, a mand
     'Units allotted for SHARMA HUF',
   ]);
 });
+
+test('compliance: HUFs onboarded here are checked for FATCA, bank, AOF and mandates', async () => {
+  const { hufDetections } = await import('../src/routes/compliance.ts');
+  const now = new Date().toISOString();
+  const add = async (code: string, nse: unknown, extra: { documents?: unknown; investments?: unknown; status?: string } = {}) => {
+    const id = newId();
+    await run(`INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, nse_status, documents, investments, created_at, updated_at)
+      VALUES (?, ?, ?, 'x', ?, 'K', 'x', ?, '{}', ?, ?, ?, ?, ?)`, id, code, `${code} HUF`, `h${code}`, extra.status ?? 'ACTIVE', JSON.stringify(nse),
+      extra.documents ? JSON.stringify(extra.documents) : null, extra.investments ? JSON.stringify(extra.investments) : null, now, now);
+    return id;
+  };
+  const accepted = { cams: { status: 'ACCEPTED' }, kfin: { status: 'ACCEPTED' } };
+  const clean = await add('RSPH000101', { bankStatus: 'ACTIVE', fatca: accepted, aof: accepted });
+  const bad = await add('RSPH000102', { bankStatus: 'REJECTED', bankRemark: 'NAME MISMATCH', fatca: { cams: { status: 'ACCEPTED' }, kfin: { status: 'REJECTED', remark: 'MISSING/INVALID UBO_EXCH' } }, aof: null }, {
+    investments: { mandates: [
+      { mandateId: 'M1', status: 'REJECTED', amount: 100000, registeredOn: '01/11/2026', remark: 'Account closed' },
+      { mandateId: 'M2', status: 'PENDING', amount: 50000, registeredOn: '01/01/2026', remark: null },
+      { mandateId: 'M3', status: 'APPROVED', amount: 50000, registeredOn: '01/01/2026', remark: null },
+    ] },
+  });
+  await add('RSPH000103', { bankStatus: 'REJECTED' }, { status: 'DRAFT' });
+
+  const found = await hufDetections();
+  assert.equal(found.filter((d) => d.entity?.id === clean).length, 0, 'a HUF NSE has accepted raises nothing');
+  assert.ok(!found.some((d) => d.detail.includes('RSPH000103')), 'a draft is not on NSE yet');
+  const mine = found.filter((d) => d.entity?.id === bad).map((d) => [d.kind, d.severity]).sort();
+  assert.deepEqual(mine, [['AOF_MISSING', 'MEDIUM'], ['FATCA_REJECTED', 'HIGH'], ['MANDATE_PENDING', 'MEDIUM'], ['MANDATE_REJECTED', 'HIGH'], ['PAYOUT_BANK_UNVERIFIED', 'HIGH']]);
+  assert.match(found.find((d) => d.kind === 'FATCA_REJECTED')!.detail, /karta as beneficial owner/);
+});
