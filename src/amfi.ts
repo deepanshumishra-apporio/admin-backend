@@ -80,7 +80,7 @@ export function parseNavAll(text: string): Map<string, AmfiFund> {
 let directory: { at: number; byIsin: Map<string, AmfiFund> } | null = null;
 let loadingDirectory: Promise<Map<string, AmfiFund>> | null = null;
 
-async function getText(url: string, timeoutMs = 30_000): Promise<string> {
+export async function getText(url: string, timeoutMs = 30_000): Promise<string> {
   const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), headers: { accept: 'text/plain, application/json' } });
   if (!res.ok) throw new Error(`${new URL(url).host} answered ${res.status}`);
   return res.text();
@@ -155,7 +155,7 @@ const Periods = [
   { key: '10Y', label: '10 years', months: 120 },
 ] as const;
 
-const minusMonths = (iso: string, months: number) => {
+export const minusMonths = (iso: string, months: number) => {
   const d = new Date(`${iso}T00:00:00Z`);
   d.setUTCMonth(d.getUTCMonth() - months);
   return d.toISOString().slice(0, 10);

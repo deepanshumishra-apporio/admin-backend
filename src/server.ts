@@ -12,6 +12,8 @@ import { hufRoutes, startHufStatusLoop } from './routes/hufs.ts';
 import { investorRoutes } from './routes/investors.ts';
 import { notificationRoutes, startNotificationLoop } from './notifications.ts';
 import { meetingRoutes } from './routes/meetings.ts';
+import { startFundReturnsLoop } from './fund-returns.ts';
+import { fundReturnsReportRoutes } from './routes/fund-returns-report.ts';
 import { reportRoutes } from './routes/reports.ts';
 import { sessionRoutes } from './routes/sessions.ts';
 import { staffRoutes } from './routes/staff.ts';
@@ -31,6 +33,8 @@ sessionRoutes(router);
 staffRoutes(router);
 investorRoutes(router);
 transactionRoutes(router);
+// Before reportRoutes: its /reports/:key would otherwise take /reports/fund-returns.
+fundReturnsReportRoutes(router);
 reportRoutes(router);
 complianceRoutes(router);
 supportRoutes(router);
@@ -52,6 +56,7 @@ startComplianceLoop();
 startHufStatusLoop();
 startInvestmentLoop();
 startNotificationLoop();
+startFundReturnsLoop();
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {

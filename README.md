@@ -143,6 +143,17 @@ a new database; on an existing one add it in Staff → Roles). For the consent p
 the dashboard server's address, so the dashboard also sends the visitor's IP in `X-RiSips-Client-IP` with that key.
 Without it, a production consent is refused rather than recorded with the wrong IP.
 
+## Fund returns by AMC (a report)
+
+[src/fund-returns.ts](src/fund-returns.ts), [src/routes/fund-returns-report.ts](src/routes/fund-returns-report.ts). Every mutual fund's
+1M, 3M, 6M, 1Y, 3Y, 5Y and 10Y return, from AMFI: the current NAVs (`NAVAll.txt`) and, for each period, one week of
+every fund's NAVs ending on its anniversary (`DownloadNAVHistoryReport_Po.aspx`, a few MB each). Worked out about 20 s
+after start and once a day after that; yesterday's figures are served while today's are made. Up to a year the change
+in NAV, beyond that compounded a year; an AMC's figure is the simple average of its funds' returns. `GET
+/reports/fund-returns` (multi-select filters as `fundHouse=A|B`, `group=amc|fund`, `sort`, `dir`) and
+`/reports/fund-returns/export?format=xlsx|pdf`, both `reports.read`; downloads are audited. The Excel and PDF files are
+written by [src/export-files.ts](src/export-files.ts) (no libraries).
+
 ## Notifications (the bell and the Inbox)
 
 [src/notifications.ts](src/notifications.ts). Each notification has a key naming its event, so a re-scan or a re-read of

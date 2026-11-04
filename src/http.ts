@@ -61,6 +61,18 @@ export class Csv {
   }
 }
 
+/** A file to download (Excel, PDF): sent as is, with its type and name. */
+export class Download {
+  readonly filename: string;
+  readonly contentType: string;
+  readonly body: Buffer;
+  constructor(filename: string, contentType: string, body: Buffer) {
+    this.filename = filename;
+    this.contentType = contentType;
+    this.body = body;
+  }
+}
+
 export type Handler = (ctx: Ctx) => unknown | Promise<unknown>;
 
 type Route = { method: string; parts: string[]; handlers: Handler[] };
@@ -181,6 +193,16 @@ export async function handle(router: Router, prefix: string, req: IncomingMessag
     let result: unknown;
     for (const handler of found.handlers) result = await handler(ctx);
 
+    if (result instanceof Download) {
+      res.writeHead(200, {
+        'content-type': result.contentType,
+        'content-disposition': `attachment; filename="${result.filename}"`,
+        'content-length': result.body.length,
+        'cache-control': 'no-store',
+      });
+      res.end(result.body);
+      return;
+    }
     if (result instanceof Csv) {
       res.writeHead(200, {
         'content-type': 'text/csv; charset=utf-8',
