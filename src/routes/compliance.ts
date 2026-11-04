@@ -164,8 +164,9 @@ async function deepDetections(snap: Snapshot): Promise<Detection[]> {
       entity: { type: 'ticket', id: t.id }, title: `Ticket TKT-${String(t.seq).padStart(5, '0')} past its SLA`, detail: `"${t.subject}" was due ${t.sla_due_at}.` });
   }
   // HUFs are few and their NSE registration (FATCA, bank) can fail before onboarding finishes, so all of them are read.
+  // A fresh KYC that failed or expired leaves the investor on the app's kyc-esign step, never onboarded: read them too.
   const targets = snap.facts.filter((f) => f.up.onboarded_at || f.accountType === 'HUF' ||
-    (!f.up.kyc_compliant && ['pan', 'pan-confirm'].includes(f.up.stage)));
+    (!f.up.kyc_compliant && ['pan', 'pan-confirm', 'kyc-esign'].includes(f.up.stage)));
   await mapLimit(targets, 3, async (f) => {
     const userExtId = String(f.up.id);
     const resp = await investorDetail(f.up.id, SystemActor).catch(() => null);

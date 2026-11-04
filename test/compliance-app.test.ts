@@ -69,7 +69,7 @@ test("an older app backend (no consent, mandate, kyc or freshness fields) raises
 test('2FA consent, AutoPay mandates, a failed fresh KYC and a stopped job each raise their alert', async () => {
   const sip = order('mfpp_sip', 12, { kind: 'sip', state: 'active', consent: { at: iso(5 * Day), via: 'otp' } });
   app = {
-    investors: [investor(11), investor(12), investor(13)],
+    investors: [investor(11), investor(12), investor(13, { stage: 'kyc-esign', onboarded_at: null, kyc_compliant: false })],
     orders: [
       order('mfp_signed', 11, { consent: { at: iso(5 * Day), via: 'otp' } }),
       order('mfp_unsigned', 11, { consent: null }),
@@ -94,6 +94,7 @@ test('2FA consent, AutoPay mandates, a failed fresh KYC and a stopped job each r
   assert.deepEqual(await open(), [
     'CONSENT_MISSING/HIGH/consent_missing:mfp_unsigned',
     'KYC_FAILED/HIGH/kyc_form:13',
+    'KYC_STALLED/MEDIUM/kyc_stalled:13',
     'MANDATE_PENDING/MEDIUM/mandate_pending:10',
     'MANDATE_REJECTED/MEDIUM/mandate_rejected:9',
     'MONITORING_STALE/HIGH/monitoring:sip-first-payments',
