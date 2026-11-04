@@ -10,6 +10,7 @@ import { complianceRoutes, startComplianceLoop } from './routes/compliance.ts';
 import { hufInvestRoutes, startInvestmentLoop } from './routes/huf-invest.ts';
 import { hufRoutes, startHufStatusLoop } from './routes/hufs.ts';
 import { investorRoutes } from './routes/investors.ts';
+import { notificationRoutes, startNotificationLoop } from './notifications.ts';
 import { meetingRoutes } from './routes/meetings.ts';
 import { reportRoutes } from './routes/reports.ts';
 import { sessionRoutes } from './routes/sessions.ts';
@@ -35,6 +36,7 @@ complianceRoutes(router);
 supportRoutes(router);
 announcementRoutes(router);
 meetingRoutes(router);
+notificationRoutes(router);
 // Before hufRoutes: its /hufs/:id would otherwise take /hufs/schemes.
 hufInvestRoutes(router);
 hufRoutes(router);
@@ -49,6 +51,7 @@ startValuationLoop();
 startComplianceLoop();
 startHufStatusLoop();
 startInvestmentLoop();
+startNotificationLoop();
 
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {

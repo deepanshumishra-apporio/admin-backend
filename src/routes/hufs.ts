@@ -13,6 +13,7 @@ import { config, nseIsLive } from '../config.ts';
 import { all, nowIso, one, run } from '../db.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
+import { hufEventNotice, hufFatcaNotice } from '../notifications.ts';
 import {
   authorisationLink, clientCodesForPan, detailsFromNse, DocumentKinds, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
   readHuf, readStatus, registerUcc, resendAuthorisation, UccStates, uploadDocument, uploadFatca,
@@ -162,7 +163,9 @@ function approvalBlock(r: Row, ctx: Ctx): string | null {
 }
 
 export async function event(hufId: string, type: string, staffId: string | null, note: string | null = null): Promise<void> {
-  await run('INSERT INTO huf_events (id, huf_id, type, staff_id, note, created_at) VALUES (?, ?, ?, ?, ?, ?)', newId(), hufId, type, staffId, note, nowIso());
+  const id = newId();
+  await run('INSERT INTO huf_events (id, huf_id, type, staff_id, note, created_at) VALUES (?, ?, ?, ?, ?, ?)', id, hufId, type, staffId, note, nowIso());
+  await hufEventNotice(id, hufId, type, note);
 }
 
 /** Reads and checks a submitted HUF; a clash with another HUF here is reported on the field. */
@@ -249,6 +252,8 @@ async function refreshOne(r: Row): Promise<void> {
   const status = await readStatus(d.clientCode, d.pan);
   const next: Status = status.authorised ? 'ACTIVE' : r.status;
   await run('UPDATE hufs SET nse_status = ?, status = ?, updated_at = ? WHERE id = ?', JSON.stringify(status), next, nowIso(), r.id);
+  const before = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus).fatca : null;
+  await hufFatcaNotice(r, before, status.fatca);
   if (next === 'ACTIVE' && r.status !== 'ACTIVE') await event(r.id, 'ACTIVE', null, 'NSE reports the karta has authorised the account.');
   if (stepsOf(r).fatca?.ok && !r.auth_link) await fetchLink(r.id, d.clientCode);
 }

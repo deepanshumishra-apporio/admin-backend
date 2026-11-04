@@ -137,6 +137,21 @@ a new database; on an existing one add it in Staff → Roles). For the consent p
 the dashboard server's address, so the dashboard also sends the visitor's IP in `X-RiSips-Client-IP` with that key.
 Without it, a production consent is refused rather than recorded with the wrong IP.
 
+## Notifications (the bell and the Inbox)
+
+[src/notifications.ts](src/notifications.ts). Each notification has a key naming its event, so a re-scan or a re-read of
+NSE never sends it twice. It goes to everyone holding its permission, or to one person; reads are per person.
+
+| Notification | Raised by | Who sees it |
+|---|---|---|
+| NSE refused a HUF's registration, order, SIP or mandate; the karta gave consent; a HUF active or synced from NSE | HUF events | `hufs.manage` |
+| CAMS or KFin rejected a HUF's FATCA | the HUF status job, when it changes | `hufs.manage` |
+| Units allotted, a SIP live, a mandate approved or rejected | the daily investments read, compared with the last one | `hufs.manage` |
+| A HUF waiting on the karta for 3+ days | every 10 min | `hufs.manage` |
+| A new high or medium compliance alert (low ones stay in Compliance) | the compliance scan | `compliance.manage` |
+| A ticket assigned to you; yours due within 2 h | ticket changes; every 10 min | that person |
+| Yesterday's sign-ups; investors ready for a week with no order | once a day after 9 AM IST | `investors.read` |
+
 ## Deploying on the AWS admin server
 
 The server's `deploy.sh` builds and runs the dashboard only. Until there is shell access, Akash applies these once:

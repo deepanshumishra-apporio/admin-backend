@@ -9,6 +9,7 @@ import { config, nseIsLive } from '../config.ts';
 import { all, nowIso, one, run } from '../db.ts';
 import { HttpError, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
+import { hufInvestmentNotices } from '../notifications.ts';
 import type { HufDetails, NseStatus } from '../nse/huf.ts';
 import {
   placePurchase, productLink, purchaseProblem, readInvestments, readMandates, registerMandate, registerXsip,
@@ -73,6 +74,7 @@ export async function refreshInvestments(r: InvestRow): Promise<Investments> {
   const d = unseal<HufDetails>(r.details);
   const inv = await readInvestments(d.clientCode, readFrom(r));
   await run('UPDATE hufs SET investments = ?, investments_read_at = ? WHERE id = ?', JSON.stringify(inv), inv.readAt, r.id);
+  await hufInvestmentNotices(r, r.investments ? (JSON.parse(r.investments) as Investments) : null, inv);
   return inv;
 }
 

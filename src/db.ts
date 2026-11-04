@@ -21,7 +21,8 @@ export type Row = Record<string, unknown>;
 
 const Tables = [
   'roles', 'staff', 'staff_roles', 'sessions', 'login_events', 'audit_log', 'id_map', 'tickets', 'ticket_messages',
-  'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings', 'hufs', 'huf_events',
+  'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings', 'hufs', 'huf_events', 'notifications',
+  'notification_reads',
 ];
 // Neon's pooled endpoint (PgBouncer) refuses a per-connection search_path, so queries name the schema themselves:
 // a table after FROM / JOIN / INTO / UPDATE is written `schema.table`.
@@ -306,6 +307,26 @@ CREATE TABLE IF NOT EXISTS huf_events (
   staff_id TEXT REFERENCES staff(id),
   note TEXT,
   created_at TEXT NOT NULL
+);
+-- The staff inbox: business events, once each (key), for whoever holds the permission or for one person.
+CREATE TABLE IF NOT EXISTS notifications (
+  id TEXT PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  href TEXT NOT NULL,
+  permission TEXT,
+  staff_id TEXT REFERENCES staff(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notifications_created ON notifications (created_at DESC);
+CREATE TABLE IF NOT EXISTS notification_reads (
+  notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  staff_id TEXT NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  read_at TEXT NOT NULL,
+  PRIMARY KEY (notification_id, staff_id)
 );
 COMMIT;
 `;

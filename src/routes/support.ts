@@ -6,6 +6,7 @@ import { all, nowIso, one, tx, TicketSeq, type Db } from '../db.ts';
 import { HttpError, oneOf, page, pageParams, str, uuidParam, listParam, type Ctx, type Router } from '../http.ts';
 import { investorExtId, snapshot, type Snapshot } from '../investors.ts';
 import { supportInvestor } from '../map.ts';
+import { notify } from '../notifications.ts';
 import { newId } from '../security.ts';
 
 const Statuses = ['OPEN', 'IN_PROGRESS', 'WAITING_ON_INVESTOR', 'RESOLVED', 'CLOSED'] as const;
@@ -168,6 +169,14 @@ export function supportRoutes(router: Router): void {
       await setStatus(q, t, status, ctx);
       await q.run('UPDATE tickets SET updated_at = ? WHERE id = ?', nowIso(), id);
     });
+    // Assigned to someone else: tell them. Assigning yourself needs no note.
+    if (assigneeId && assigneeId !== t.assignee_id && assigneeId !== ctx.staff!.id) {
+      await notify({
+        key: `ticket:${id}:assigned:${assigneeId}:${nowIso()}`, kind: 'Support', severity: t.priority === 'URGENT' || t.priority === 'HIGH' ? 'HIGH' : 'MEDIUM',
+        permission: null, staffId: assigneeId, href: `/support/${id}`,
+        title: `Ticket #${t.seq} assigned to you`, detail: `${t.subject}. Assigned by ${ctx.staff!.fullName}.`,
+      });
+    }
     await audit(ctx, 'ticket.updated', id);
     return detail(id, await snapshot(ctx));
   });

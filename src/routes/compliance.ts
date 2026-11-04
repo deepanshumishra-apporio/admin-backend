@@ -6,6 +6,7 @@ import { all, nowIso, one, run, tx } from '../db.ts';
 import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { snapshot, type Snapshot } from '../investors.ts';
 import { fatcaRejection, flagOf, isOrder, isPlan, ms, money0, supportInvestor, type Facts } from '../map.ts';
+import { notify } from '../notifications.ts';
 import { newId, uuidFor } from '../security.ts';
 import { investorDetail, mapLimit } from '../upstream.ts';
 
@@ -198,6 +199,7 @@ export async function scan(deepRequested: boolean) {
       return { mode: 'ran' as const, detected: unique.length, raised: 0, reopened: 0, autoResolved: 0, at };
     }
     let raised = 0;
+    const fresh: { id: string; severity: string; title: string; detail: string }[] = [];
     let reopened = 0;
     let autoResolved = 0;
     await tx(async (q) => {
@@ -210,6 +212,7 @@ export async function scan(deepRequested: boolean) {
                VALUES (?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?)`,
             id, d.kind, d.severity, d.dedupeKey, d.userExtId, d.entity?.type ?? null, d.entity?.id ?? null, d.title, d.detail, at, at);
           await q.run("INSERT INTO alert_events (id, alert_id, type, note, created_at) VALUES (?, ?, 'RAISED', NULL, ?)", newId(), id, at);
+          fresh.push({ id, severity: d.severity, title: d.title, detail: d.detail });
           raised++;
           continue;
         }
@@ -231,6 +234,11 @@ export async function scan(deepRequested: boolean) {
         at, JSON.stringify({ detected: seen.size, raised, reopened, autoResolved, deep }));
       if (deep) await q.run("INSERT INTO jobs (name, last_run_at) VALUES ('compliance-deep', ?) ON CONFLICT (name) DO UPDATE SET last_run_at = excluded.last_run_at", at);
     });
+    // New alerts that need a person; low ones (a missing email, a nominee) wait in the compliance list.
+    for (const a of fresh) {
+      if (a.severity === 'LOW') continue;
+      await notify({ key: `alert:${a.id}`, kind: 'Compliance', severity: a.severity as 'HIGH' | 'MEDIUM', permission: 'compliance.manage', href: `/compliance/${a.id}`, title: a.title, detail: a.detail });
+    }
     // A light scan can't see deep findings, so the fingerprint it compares against is always a light one.
     lastFingerprint = deep ? JSON.stringify(unique.filter((d) => !DeepKinds.has(d.kind)).map((d) => [d.dedupeKey, d.severity, d.title, d.detail]).sort()) : fingerprint;
     if (deep) lastDeepAt = Date.now();
