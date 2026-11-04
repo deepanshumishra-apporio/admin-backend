@@ -50,13 +50,18 @@ a UUID derived from its kind and id (`uuidFor`), remembered in `id_map` so it ca
 
 ## What the Admin API can't do yet (agree the fields with Akash)
 
+Since app commit 7d1dace (on `prod`, 2026-11-04) it also sends: `consent` on orders and plans (2FA `{ at, via }`), `mandate` and
+`kyc` (fresh KYC) on `/investors/:id`, and `freshness` on `/summary`. The record shows them (mandates, a SIP's mandate,
+AutoPay readiness, KYC forms, 2FA on an order or plan) and compliance raises CONSENT_MISSING, MANDATE_*, KYC_FAILED and
+MONITORING_STALE from them. Every field is optional: an app backend without them shows what it did before.
+
 | Dashboard feature | What's missing |
 |---|---|
-| Mandates (investor record, dashboard, `MANDATE_*` alerts) | no mandate data in the Admin API |
 | Nudge / remind investor | a write path to notify investors in the app. Answers `501 NOT_AVAILABLE` |
 | Risip Bot chats; tickets investors raise in the app | the conversations live in the app backend. The chat queue is empty; staff-logged phone/email tickets work |
 | Announcements reaching the app (banner, notification, seen/tap counts) | the app backend must read them from here. Writing and approving works; delivery counts stay 0 |
-| Last login / KYC forms / consent / gateway on records | not in the Admin API; shown as empty |
+| Last login / gateway on records | not in the Admin API; shown as empty |
+| Redemption payout, KRA re-checks, PEP | FP gives no payout date or UTR; the app checks the KRA only at onboarding and never asks about PEP |
 | Sign-ups over time, AUM total | computed by paging every investor; fine now, slow at thousands. A `/summary` field would help |
 | HUFs (see below) | no account type, HUF or NSE fields yet. Until they arrive every investor shows as an individual |
 

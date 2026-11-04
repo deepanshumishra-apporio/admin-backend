@@ -136,6 +136,28 @@ test("a new sign-up: the app's portfolio has no summary or holdings yet, and the
   assert.equal(detail.summary.stage, 'SIGNED_UP');
 });
 
+test("the record shows the app's mandate and fresh KYC; an older app without them shows what it did before", () => {
+  const investor = { id: 12, name: 'Sip User', email: 's@x.in', mobile: '9', stage: 'active', kyc_compliant: true, pan_masked: '******123A',
+    signed_up_at: '2026-10-01 06:10:00', onboarded_at: '2026-10-02 06:10:00', orders: 0, plans: 1, nominee_opted_out: true };
+  const sip = { id: 'mfpp_1', kind: 'sip', isin: 'INF1', amount: 1000, units: null, nav: null, state: 'active', created_at: '2026-10-03 06:10:00',
+    updated_at: '2026-10-03 06:10:00', user_id: 12, next_debit: '2026-11-10', consent: { at: '2026-10-03T06:10:00.000Z', via: 'otp' } };
+  const mandate = { id: '77', status: 'APPROVED', type: 'E_MANDATE', limit: 50000, umrn_masked: '****5678', valid_from: null, valid_to: null, created_at: '2026-10-03 06:00:00' };
+  const kyc = { fresh: true, form_status: 'failed', form_reason: 'Signature unclear', submitted_at: '2026-10-02 06:00:00', expires_at: null, kra_checked_at: null, kra_approved_at: null };
+
+  const now = investorDetail({ investor: { ...investor, mandate, kyc }, orders: [], sips: [sip], stps: [], swps: [] }, null, new Map());
+  assert.deepEqual(now.mandates, [{ id: '77', type: 'E_MANDATE', status: 'APPROVED', limit: '50000.00', approvedAt: null, createdAt: '2026-10-03T06:00:00.000Z' }]);
+  assert.deepEqual(now.investments.plans.sips[0]!.mandate, { type: 'E_MANDATE', status: 'APPROVED' });
+  assert.equal(now.investments.upcoming[0]!.mandateReady, true);
+  assert.equal(now.kyc.forms[0]!.status, 'failed');
+  assert.equal(now.kyc.forms[0]!.reason, 'Signature unclear');
+
+  const older = investorDetail({ investor, orders: [], sips: [sip], stps: [], swps: [] }, null, new Map());
+  assert.deepEqual(older.mandates, []);
+  assert.equal(older.investments.plans.sips[0]!.mandate, null);
+  assert.equal(older.investments.upcoming[0]!.mandateReady, null, 'unknown, not "not ready"');
+  assert.deepEqual(older.kyc.forms, []);
+});
+
 test('CSV escapes quotes and neutralises formulas', () => {
   const csv = toCsv([{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], [{ a: '=HYPERLINK("x")', b: -12.5 }]);
   assert.equal(csv, '﻿A,B\r\n"\'=HYPERLINK(""x"")",-12.5\r\n');

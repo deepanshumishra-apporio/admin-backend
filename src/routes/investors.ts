@@ -269,6 +269,7 @@ export function investorRoutes(router: Router): void {
     const resp = await fetchDetail(extId, actor);
     const plans = [...(resp.sips ?? []), ...(resp.stps ?? []), ...(resp.swps ?? [])];
     const bank = resp.investor.bank;
+    const mandate = resp.investor.mandate ?? null;
 
     if (type === 'holding') {
       const port = await portfolio(extId, actor);
@@ -301,6 +302,8 @@ export function investorRoutes(router: Router): void {
         type: 'plan',
         plan: {
           ...toPlan(p),
+          // A SIP's mandate in full on its own panel (the UMRN comes masked from the app).
+          mandate: p.kind === 'sip' && mandate ? { type: mandate.type ?? 'unknown', status: mandate.status ?? 'UNKNOWN', umrn: mandate.umrn_masked } : null,
           fpId: p.fp_id ?? p.id,
           gateway: null,
           requestedActivationDate: null,
@@ -310,7 +313,7 @@ export function investorRoutes(router: Router): void {
           autoCancelled: null,
           cancellationCode: p.state === 'cancelled' ? p.failure_code ?? null : null,
           cancellationScheduledOn: null,
-          consentAt: null,
+          consentAt: iso(p.consent?.at),
           paymentMethod: p.kind === 'sip' ? 'mandate' : null,
           purpose: null,
           installments: planInstallments(p),
@@ -338,7 +341,8 @@ export function investorRoutes(router: Router): void {
           tradedOn: o.traded_on ?? null,
           initiatedBy: null,
           initiatedVia: null,
-          consent: null,
+          // The investor's 2FA OTP for this order: when, and how. The app never sends the mobile or email it went to.
+          consent: o.consent ? { at: iso(o.consent.at)!, via: o.consent.via } : null,
           payoutAccount: o.kind === 'redemption' && bank ? { accountNumber: bank.account_masked, ifsc: bank.ifsc } : null,
           plan: null,
           payments,

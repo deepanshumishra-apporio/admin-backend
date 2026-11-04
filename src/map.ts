@@ -4,7 +4,7 @@ import { config } from './config.ts';
 import { uuidFor } from './security.ts';
 import {
   firstPayment,
-  type Lists, type UpDetailResponse, type UpFatcaStatus, type UpFund, type UpHolding, type UpInvestor, type UpInvestorDetail, type UpOrder, type UpPortfolio,
+  type Lists, type UpDetailResponse, type UpFatcaStatus, type UpFund, type UpHolding, type UpInvestor, type UpInvestorDetail, type UpMandate, type UpOrder, type UpPortfolio,
 } from './upstream.ts';
 
 // --- vocabularies ------------------------------------------------------------------------------
@@ -205,7 +205,11 @@ export function installmentToOrder(plan: UpOrder, i: Record<string, unknown>, in
   };
 }
 
-export function toPlan(p: UpOrder) {
+/** The investor's AutoPay mandate as a SIP shows it; null when the app sent none (or is too old to send it). */
+const sipMandate = (m: UpMandate | null | undefined) => (m ? { type: m.type ?? 'unknown', status: m.status ?? 'UNKNOWN' } : null);
+
+/** A plan. A SIP debits through the investor's one AutoPay mandate, so it carries that mandate when it's known. */
+export function toPlan(p: UpOrder, mandate: UpMandate | null = null) {
   const installments = installmentOrders(p);
   const succeeded = installments.filter((i) => i['state'] === 'successful').length;
   const pause = (p['pause'] ?? null) as Record<string, unknown> | null;
@@ -229,7 +233,7 @@ export function toPlan(p: UpOrder) {
     installmentsPlaced: installments.length,
     installmentsSucceeded: num(p['paid_count']) ?? succeeded,
     pause: pause ? { state: 'PAUSED', from: iso(pause['from']), to: iso(pause['to']) } : null,
-    mandate: null,
+    mandate: p.kind === 'sip' ? sipMandate(mandate) : null,
     folioNumber: p.folio ?? null,
     createdAt: iso(p.created_at)!,
     cancelledAt: cancelled ? iso(p.updated_at) : null,
@@ -609,7 +613,8 @@ export function toPayment(g: PaymentGroup) {
   };
 }
 
-export function investments(userId: number, orders: UpOrder[], plans: UpOrder[], port: UpPortfolio | null) {
+export function investments(userId: number, orders: UpOrder[], plans: UpOrder[], port: UpPortfolio | null, mandate?: UpMandate | null) {
+  const asPlan = (x: UpOrder) => toPlan(x, mandate ?? null);
   const holdings = (port?.holdings ?? []).map((h) => toHolding(userId, h));
   const folios = new Map<string, { number: string; amcCode: string | null; holdingPattern: string | null; isins: Set<string> }>();
   for (const item of [...(port?.holdings ?? []), ...orders.filter((o) => o.folio)]) {
@@ -640,9 +645,9 @@ export function investments(userId: number, orders: UpOrder[], plans: UpOrder[],
     },
     folios: [...folios.values()].map((f) => ({ number: f.number, amcCode: f.amcCode, holdingPattern: f.holdingPattern, schemes: f.isins.size })),
     plans: {
-      sips: sips.map(toPlan),
-      swps: plans.filter((p) => p.kind === 'swp').map(toPlan),
-      stps: plans.filter((p) => p.kind === 'stp').map(toPlan),
+      sips: sips.map(asPlan),
+      swps: plans.filter((p) => p.kind === 'swp').map(asPlan),
+      stps: plans.filter((p) => p.kind === 'stp').map(asPlan),
     },
     summary: {
       activeSips: active.length,
@@ -664,7 +669,8 @@ export function investments(userId: number, orders: UpOrder[], plans: UpOrder[],
         date,
         amount: money(p.amount),
         units: null,
-        mandateReady: null,
+        // A SIP instalment debits through AutoPay: ready once the mandate is approved. Unknown without mandate data.
+        mandateReady: p.kind === 'sip' && mandate !== undefined ? mandate?.status === 'APPROVED' : null,
         paused: Boolean(p['pause']),
       })),
     orders: [...orders.map(toOrder), ...plans.flatMap(planInstallments)].sort((a, b) => b.placedAt.localeCompare(a.placedAt)),
@@ -760,7 +766,15 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
             dateOfBirth: { status: null, code: null },
           }
         : null,
-      forms: [],
+      // A fresh KYC (a PAN the KRA had no KYC for), as the app last read it from Cybrilla POA.
+      forms: up.kyc?.fresh && up.kyc.form_status
+        ? [{
+            id: `fresh-kyc-${up.id}`, type: 'fresh_kyc', status: up.kyc.form_status, reason: up.kyc.form_reason,
+            nextStep: null, proofStatus: null, esignStatus: null, signatureProvided: false, outstandingFields: [],
+            createdAt: iso(up.kyc.submitted_at) ?? iso(up.signed_up_at)!, submittedAt: iso(up.kyc.submitted_at),
+            failedAt: null, expiresAt: iso(up.kyc.expires_at),
+          }]
+        : [],
     },
     profile: {
       id: uuidFor('profile', up.id),
@@ -800,10 +814,12 @@ export function investorDetail(resp: UpDetailResponse, port: UpPortfolio | null,
           }]
         : [],
     },
-    mandates: [],
+    mandates: up.mandate
+      ? [{ id: up.mandate.id, type: up.mandate.type ?? 'unknown', status: up.mandate.status ?? 'UNKNOWN', limit: money(up.mandate.limit) ?? '0', approvedAt: null, createdAt: iso(up.mandate.created_at) ?? '' }]
+      : [],
     huf: hufOf(up),
     nse: nseOf(up),
-    investments: investments(up.id, resp.orders, plans, port),
+    investments: investments(up.id, resp.orders, plans, port, 'mandate' in up ? up.mandate ?? null : undefined),
     timeline: timeline(up, resp.orders, plans),
   };
 }
