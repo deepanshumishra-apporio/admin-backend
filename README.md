@@ -145,11 +145,17 @@ Without it, a production consent is refused rather than recorded with the wrong 
 
 ## Fund returns by AMC (a report)
 
-[src/fund-returns.ts](src/fund-returns.ts), [src/routes/fund-returns-report.ts](src/routes/fund-returns-report.ts). Every mutual fund's
-1M, 3M, 6M, 1Y, 3Y, 5Y and 10Y return, from AMFI: the current NAVs (`NAVAll.txt`) and, for each period, one week of
-every fund's NAVs ending on its anniversary (`DownloadNAVHistoryReport_Po.aspx`, a few MB each). Worked out about 20 s
-after start and once a day after that; yesterday's figures are served while today's are made. Up to a year the change
-in NAV, beyond that compounded a year; an AMC's figure is the simple average of its funds' returns. `GET
+[src/fund-returns.ts](src/fund-returns.ts), [src/routes/fund-returns-report.ts](src/routes/fund-returns-report.ts). The 1M, 3M,
+6M, 1Y, 3Y, 5Y and 10Y return of every fund RiSips sells through FintechPrimitives (the app backend's `GET
+/admin/v1/funds`, about 1,230 funds across 30 AMCs on production), matched to AMFI by ISIN for the fund house and SEBI
+category. An app backend without `/funds` (404) falls back to every AMFI fund, and the screen says so. Returns come
+from AMFI: the current NAVs (`NAVAll.txt`) and, for each period, one week of every fund's NAVs ending on its anniversary
+(`DownloadNAVHistoryReport_Po.aspx`, a few MB each). AMFI sometimes answers 200 with an empty file: a history file with
+fewer than 1,000 funds is retried twice, then the refresh fails and yesterday's figures stay (never a day of blank
+columns). A face-value change (Navi Liquid ₹1,000 → ₹10) shows as a 4x fall or 8x rise between two anniversaries;
+that period and every longer one are left out. Worked out about a minute after start and once a day after that;
+yesterday's figures are served while today's are made. Up to a year the change in NAV, beyond that compounded a year;
+an AMC's figure is the simple average of its funds' returns, and a dash means none of its funds is that old. `GET
 /reports/fund-returns` (multi-select filters as `fundHouse=A|B`, `group=amc|fund`, `sort`, `dir`) and
 `/reports/fund-returns/export?format=xlsx|pdf`, both `reports.read`; downloads are audited. The Excel and PDF files are
 written by [src/export-files.ts](src/export-files.ts) (no libraries).

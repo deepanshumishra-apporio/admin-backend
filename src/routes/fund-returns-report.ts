@@ -1,11 +1,11 @@
-// The "Fund returns by AMC" report: 1 month to 10 year returns of every mutual fund, by fund house or fund by fund,
+// The "Fund returns by AMC" report: 1 month to 10 year returns of every fund RiSips sells through FP, by fund house or fund by fund,
 // with multi-select filters, on screen and as Excel or PDF (audited, like every report download).
 import { audit, authenticate, need } from '../auth.ts';
 import { Download, HttpError, type Router } from '../http.ts';
 import { istDate } from '../map.ts';
 import { pdf, xlsx, type ExportCell, type ExportColumn } from '../export-files.ts';
 import {
-  Basis, byAmc, facets, FilterKeys, fundReturns, matches, Periods, sortRows, type FilterKey, type FundReturn, type ReturnsQuery,
+  basis, byAmc, facets, FilterKeys, fundReturns, matches, Periods, sortRows, type FilterKey, type FundReturn, type ReturnsQuery,
 } from '../fund-returns.ts';
 
 const FilterLabels: Record<FilterKey, string> = {
@@ -54,10 +54,10 @@ export function fundReturnsReportRoutes(router: Router): void {
 
   router.get('/reports/fund-returns', full, read, async (ctx) => {
     const q = queryOf(ctx.query);
-    const { asOf, funds } = await load();
+    const { asOf, source, funds } = await load();
     const { chosen, amcs, funds: list } = rowsFor(funds, q);
     return {
-      asOf, basis: Basis, query: q, periods: Periods.map((p) => ({ key: p.key, label: p.label })),
+      asOf, source, basis: basis(source), query: q, periods: Periods.map((p) => ({ key: p.key, label: p.label })),
       totalFunds: chosen.length, totalAmcs: new Set(chosen.map((f) => f.fundHouse)).size,
       facets: facets(funds, q.filters),
       amcs,
@@ -70,7 +70,7 @@ export function fundReturnsReportRoutes(router: Router): void {
   router.get('/reports/fund-returns/export', full, read, async (ctx) => {
     const q = queryOf(ctx.query);
     const format = ctx.query.get('format') === 'pdf' ? 'pdf' : 'xlsx';
-    const { asOf, funds } = await load();
+    const { asOf, source, funds } = await load();
     const { chosen, amcs, funds: list } = rowsFor(funds, q);
     const percent = (label: string): ExportColumn => ({ label, kind: 'percent', width: 10 });
     const periods = Periods.map((p) => percent(p.label));
@@ -81,16 +81,16 @@ export function fundReturnsReportRoutes(router: Router): void {
       rows = amcs.map((r, i) => [i + 1, r.fundHouse, r.funds, ...Periods.map((p) => r.returns[p.key])]);
     } else {
       columns = [
-        { label: 'S No', kind: 'count', width: 6 }, { label: 'Fund', kind: 'text', width: 40 }, { label: 'AMC', kind: 'text', width: 22 },
+        { label: 'S No', kind: 'count', width: 6 }, { label: 'Fund', kind: 'text', width: 40 }, { label: 'ISIN', kind: 'text', width: 14 }, { label: 'AMC', kind: 'text', width: 22 },
         { label: 'Category', kind: 'text', width: 18 }, { label: 'Plan', kind: 'text', width: 8 }, { label: 'Option', kind: 'text', width: 8 }, ...periods,
       ];
-      rows = list!.map((f, i) => [i + 1, f.name, f.fundHouse, f.category, f.plan, f.option, ...Periods.map((p) => f.returns[p.key])]);
+      rows = list!.map((f, i) => [i + 1, f.name, f.isin ?? '', f.fundHouse, f.category, f.plan, f.option, ...Periods.map((p) => f.returns[p.key])]);
     }
     const title = amcs ? 'Fund returns by AMC' : 'Fund returns, fund by fund';
     const notes = [
       title,
       `NAVs as of ${asOf}. ${chosen.length} funds${amcs ? ` across ${amcs.length} AMCs` : ''}. ${filterNote(q)}.`,
-      Basis,
+      basis(source),
     ];
     await audit(ctx, 'report.exported', 'fund-returns', { format, group: q.group, rows: rows.length, filters: q.filters });
     const name = `risips-fund-returns-${q.group === 'fund' ? 'by-fund' : 'by-amc'}-${istDate(Date.now())}`;

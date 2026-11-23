@@ -18,6 +18,25 @@ export type UpFund = {
   nav_date?: string | null;
 };
 
+/** A fund the app sells (`GET /funds`): on production, every fund FP sells on ONDC. Public scheme data. */
+export type UpCatalogFund = {
+  isin: string;
+  amfi_code?: string | null;
+  name: string;
+  amc?: string;
+  amc_short?: string;
+  category?: string;
+  sub_category?: string;
+  plan?: string;
+  option?: string;
+  nav?: number | null;
+  nav_date?: string | null;
+  /** The first NAV the app has for the fund. */
+  since?: string | null;
+  lumpsum_allowed?: boolean;
+  sip_allowed?: boolean;
+};
+
 export type UpInvestor = {
   id: number;
   name: string | null;

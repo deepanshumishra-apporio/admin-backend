@@ -112,3 +112,37 @@ test('PDF: a well-formed file with every row, typographic characters made safe',
   const xref = Number(file.match(/startxref\n(\d+)/)![1]);
   assert.equal(file.slice(xref, xref + 4), 'xref', 'the cross-reference offset points at the table');
 });
+
+test("FP's funds: matched to AMFI by ISIN for the fund house and category, once per AMFI code", async () => {
+  const { fpFundsOf } = await import('../src/fund-returns.ts');
+  const funds = fpFundsOf([
+    { isin: 'INF000000011', amfi_code: '1', name: 'Alpha Large Cap Fund - Direct Growth', amc: 'Alpha MF', plan: 'Direct', option: 'Growth', since: '2015-01-01' },
+    { isin: 'inf000000011', amfi_code: '1', name: 'duplicate', amc: 'Alpha MF' },
+    { isin: 'INF999999999', amfi_code: '9', name: 'New Fund - Regular Growth', amc: 'Gamma Mutual Fund', category: 'Equity', sub_category: 'Small Cap Fund', plan: 'Regular', option: 'Growth', nav: 10.2, nav_date: '2026-11-02' },
+    { isin: 'INF888888888', amfi_code: null, name: 'No code', amc: 'Gamma Mutual Fund', nav: 10, nav_date: '2026-11-02' },
+  ], directory);
+  assert.equal(funds.length, 2);
+  const alpha = funds.find((f) => f.amfiCode === '1')!;
+  assert.equal(alpha.fundHouse, 'Alpha Mutual Fund', "AMFI's fund house name");
+  assert.equal(alpha.category, 'Large Cap Fund');
+  assert.equal(alpha.nav, 120, "AMFI's latest NAV");
+  assert.equal(alpha.isin, 'INF000000011');
+  assert.equal(alpha.since, '2015-01-01');
+  const gamma = funds.find((f) => f.amfiCode === '9')!;
+  assert.equal(gamma.fundHouse, 'Gamma Mutual Fund', "not in AMFI's file: FP's details");
+  assert.equal(gamma.assetClass, 'Equity');
+  assert.equal(gamma.nav, 10.2);
+});
+
+test('a face-value change (₹1,000 to ₹10) leaves that period and every longer one out', async () => {
+  const { chainedStarts, buildReturns } = await import('../src/fund-returns.ts');
+  assert.deepEqual(chainedStarts(30, [29.9, 29.5, 29, 28, 25, 2300, 1500]), [29.9, 29.5, 29, 28, 25, undefined, undefined]);
+  assert.deepEqual(chainedStarts(100, [undefined, 90, 400, 80]), [undefined, 90, undefined, undefined], 'a missing NAV is skipped, a 4x fall breaks');
+  assert.deepEqual(chainedStarts(100, [95, 90, 80, 70, 40, 20, 12]), [95, 90, 80, 70, 40, 20, 12], 'a real 8x rise over 10 years stays');
+  const f = { amfiCode: '7', isin: 'INF7', name: 'Navi Liquid Fund - Regular Growth', fundHouse: 'Navi', assetClass: 'Debt', category: 'Liquid Fund', structure: 'Open Ended', plan: 'Regular', option: 'Growth', nav: 30, navDate: '2026-11-22', since: null };
+  const navs = new Map([['1Y', new Map([['7', { nav: 28.4, date: '' }]])], ['5Y', new Map([['7', { nav: 2300, date: '' }]])], ['10Y', new Map([['7', { nav: 1500, date: '' }]])]]) as never;
+  const [r] = buildReturns([f], navs);
+  assert.equal(r!.returns['1Y'], 5.63);
+  assert.equal(r!.returns['5Y'], null);
+  assert.equal(r!.returns['10Y'], null);
+});

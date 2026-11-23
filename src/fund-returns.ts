@@ -1,8 +1,10 @@
-// Fund returns by AMC: every mutual fund's 1 month to 10 year return, from AMFI's NAVs, grouped by fund house.
-// AMFI publishes every fund's NAV for a date range in one file, so the NAV on each anniversary (today, 1M, 3M, 6M,
-// 1Y, 3Y, 5Y, 10Y ago) is eight small downloads a day instead of one per fund. Public data only: nothing about an
-// investor is sent or used.
-import { amfiDirectory, getText, isoDate, minusMonths, type AmfiFund } from './amfi.ts';
+// Fund returns by AMC: the 1 month to 10 year return of every fund RiSips sells through FintechPrimitives (the app
+// backend's `/admin/v1/funds`), from AMFI's NAVs, grouped by fund house. AMFI publishes every fund's NAV for a date
+// range in one file, so the NAV on each anniversary (today, 1M, 3M, 6M, 1Y, 3Y, 5Y, 10Y ago) is eight small downloads
+// a day instead of one per fund. Public data only: nothing about an investor is sent or used.
+import { amfiDirectory, classify, getText, isoDate, minusMonths, type AmfiFund } from './amfi.ts';
+import { HttpError } from './http.ts';
+import { upstream, type UpCatalogFund } from './upstream.ts';
 
 const DayMs = 86_400_000;
 const HistoryUrl = (from: string, to: string) => `https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt=${amfiDay(from)}&todt=${amfiDay(to)}`;
@@ -38,10 +40,15 @@ export function navsOn(text: string, onOrBefore: string): Map<string, { nav: num
 }
 
 export type FundReturn = {
-  amfiCode: string; name: string; fundHouse: string; assetClass: string; category: string; structure: string;
+  amfiCode: string; isin: string | null; name: string; fundHouse: string; assetClass: string; category: string; structure: string;
   plan: 'Direct' | 'Regular'; option: 'Growth' | 'IDCW'; nav: number; navDate: string;
+  /** The first NAV the app has for the fund (FP funds only). */
+  since: string | null;
   returns: Record<PeriodKey, number | null>;
 };
+
+/** A fund to work returns out for: AMFI's record of it, with the ISIN FP sells it under. */
+export type ReportFund = AmfiFund & { isin: string | null; since: string | null };
 
 /** Up to a year: the change in NAV. Beyond: compounded a year. Null when the fund is younger than the period. */
 export function periodReturn(start: number | undefined, end: number, months: number): number | null {
@@ -52,53 +59,137 @@ export function periodReturn(start: number | undefined, end: number, months: num
 }
 
 /** Every fund AMFI lists with a NAV in the last month, once each (AMFI lists a fund under two ISINs for IDCW). */
-export function fundsOf(directory: Map<string, AmfiFund>, asOf: string): AmfiFund[] {
+export function fundsOf(directory: Map<string, AmfiFund>, asOf: string): ReportFund[] {
   const cut = addDays(asOf, -31);
-  const byCode = new Map<string, AmfiFund>();
-  for (const f of directory.values()) if (f.nav && f.navDate && f.navDate >= cut) byCode.set(f.amfiCode, f);
+  const byCode = new Map<string, ReportFund>();
+  for (const f of directory.values()) if (f.nav && f.navDate && f.navDate >= cut) byCode.set(f.amfiCode, { ...f, isin: null, since: null });
   return [...byCode.values()];
 }
 
-export function buildReturns(funds: AmfiFund[], navsByPeriod: Map<PeriodKey, Map<string, { nav: number; date: string }>>): FundReturn[] {
-  return funds.map((f) => ({
-    amfiCode: f.amfiCode, name: f.name, fundHouse: f.fundHouse, assetClass: f.assetClass, category: f.category, structure: f.structure,
-    plan: f.plan && /direct/i.test(f.plan) ? 'Direct' : /direct/i.test(f.name) ? 'Direct' : 'Regular',
-    option: /IDCW|dividend|payout|reinvest|bonus/i.test(`${f.option ?? ''} ${f.option ? '' : f.name}`) ? 'IDCW' : 'Growth',
-    nav: f.nav!, navDate: f.navDate!,
-    returns: Object.fromEntries(Periods.map((p) => [p.key, periodReturn(navsByPeriod.get(p.key)?.get(f.amfiCode)?.nav, f.nav!, p.months)])) as Record<PeriodKey, number | null>,
-  }));
+/**
+ * The funds FP sells (the app backend's list), each matched to AMFI by ISIN for its fund house, SEBI category and
+ * latest NAV. A fund AMFI doesn't list under that ISIN keeps FP's own details and AMFI code.
+ */
+export function fpFundsOf(fp: UpCatalogFund[], directory: Map<string, AmfiFund>): ReportFund[] {
+  const byCode = new Map<string, ReportFund>();
+  for (const f of fp) {
+    const a = directory.get(String(f.isin).toUpperCase());
+    const amfiCode = a?.amfiCode ?? String(f.amfi_code ?? '');
+    if (!/^\d+$/.test(amfiCode) || byCode.has(amfiCode)) continue;
+    const kind = a ?? classify(`Open Ended Schemes(${f.category ?? 'Other'} Scheme - ${f.sub_category ?? f.category ?? 'Other'})`);
+    byCode.set(amfiCode, {
+      amfiCode, name: f.name, fundHouse: a?.fundHouse || f.amc || 'Other',
+      structure: kind.structure, assetClass: kind.assetClass, category: kind.category,
+      plan: f.plan ?? a?.plan ?? null, option: f.option ?? a?.option ?? null,
+      // AMFI's NAV is published each evening; FP's list carries the NAV from when the app last refreshed it.
+      nav: a?.nav ?? f.nav ?? null, navDate: a?.navDate ?? f.nav_date ?? null,
+      isin: f.isin, since: f.since ?? null,
+    });
+  }
+  return [...byCode.values()].filter((f) => f.nav && f.navDate);
 }
 
-let cache: { day: string; asOf: string; funds: FundReturn[] } | null = null;
-let loading: Promise<{ asOf: string; funds: FundReturn[] }> | null = null;
+/**
+ * A fund's NAV on each anniversary, newest first, must chain: a fund house that changed the face value (₹1,000 to
+ * ₹10, as Navi Liquid did) or consolidated units shows as a fall of 99% or a jump of 50x between two anniversaries.
+ * That isn't a return, so that period and every longer one are left out.
+ */
+export function chainedStarts(nav: number, starts: (number | undefined)[]): (number | undefined)[] {
+  let newer = nav;
+  let broken = false;
+  return starts.map((start) => {
+    if (broken || !start) return undefined;
+    const ratio = newer / start;
+    if (ratio < 0.25 || ratio > 8) {
+      broken = true;
+      return undefined;
+    }
+    newer = start;
+    return start;
+  });
+}
+
+export function buildReturns(funds: ReportFund[], navsByPeriod: Map<PeriodKey, Map<string, { nav: number; date: string }>>): FundReturn[] {
+  return funds.map((f) => {
+    const starts = chainedStarts(f.nav!, Periods.map((p) => navsByPeriod.get(p.key)?.get(f.amfiCode)?.nav));
+    return {
+      amfiCode: f.amfiCode, isin: f.isin, name: f.name, fundHouse: f.fundHouse, assetClass: f.assetClass, category: f.category, structure: f.structure,
+      plan: f.plan && /direct/i.test(f.plan) ? 'Direct' : /direct/i.test(f.name) ? 'Direct' : 'Regular',
+      option: /IDCW|dividend|payout|reinvest|bonus/i.test(`${f.option ?? ''} ${f.option ? '' : f.name}`) ? 'IDCW' : 'Growth',
+      nav: f.nav!, navDate: f.navDate!, since: f.since,
+      returns: Object.fromEntries(Periods.map((p, i) => [p.key, periodReturn(starts[i], f.nav!, p.months)])) as Record<PeriodKey, number | null>,
+    };
+  });
+}
+
+/** Which funds the report covers: FP's (normal), or every AMFI fund while the app backend has no fund list yet. */
+export type FundSource = 'fp' | 'amfi';
+export type Returns = { asOf: string; source: FundSource; funds: FundReturn[] };
+
+/** FP's funds from the app backend; null from an app backend too old to have `/funds`. */
+async function fpFunds(): Promise<UpCatalogFund[] | null> {
+  try {
+    return (await upstream<{ data: UpCatalogFund[] }>('/funds', 'system:fund-returns', 60_000)).data;
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+/** A real week of AMFI history has thousands of funds; fewer means AMFI sent an empty or cut-off file. */
+export const MinFundsInHistory = 1_000;
 
 /**
- * Every fund's returns as of AMFI's latest NAV date, worked out once a day (about 20 seconds). Each period reads a
+ * Each fund's NAV on or before `on`, from the week ending that day. AMFI sometimes answers 200 with an empty or cut-off
+ * file: that is tried again, then refused, so a bad answer never becomes a day of blank columns (yesterday's stay).
+ */
+async function navsAround(on: string, tries = 3): Promise<Map<string, { nav: number; date: string }>> {
+  let last = '';
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const navs = navsOn(await getText(HistoryUrl(addDays(on, -6), on), 120_000), on);
+      if (navs.size >= MinFundsInHistory) return navs;
+      last = `only ${navs.size} funds in AMFI's history for ${on}`;
+    } catch (error) {
+      last = (error as Error).message;
+    }
+    if (i < tries) await new Promise((resolve) => setTimeout(resolve, 5_000 * i));
+  }
+  throw new Error(last);
+}
+
+let cache: (Returns & { day: string }) | null = null;
+let loading: Promise<Returns> | null = null;
+
+/**
+ * Every fund's returns as of AMFI's latest NAV date, worked out once a day (about a minute). Each period reads a
  * week of NAVs ending on its anniversary, so a holiday on the day itself still finds the NAV before it. Yesterday's
  * figures are served while today's are worked out, so a page never waits on AMFI once the first run is done.
  */
-export function fundReturns(): Promise<{ asOf: string; funds: FundReturn[] }> {
+export function fundReturns(): Promise<Returns> {
   const today = new Date().toISOString().slice(0, 10);
   if (cache && cache.day === today) return Promise.resolve(cache);
   const refresh = refreshReturns(today);
   return cache ? Promise.resolve(cache) : refresh;
 }
 
-function refreshReturns(today: string): Promise<{ asOf: string; funds: FundReturn[] }> {
+function refreshReturns(today: string): Promise<Returns> {
   loading ??= (async () => {
-    const directory = await amfiDirectory();
+    const [directory, fp] = await Promise.all([amfiDirectory(), fpFunds()]);
     const asOf = [...directory.values()].map((f) => f.navDate ?? '').sort().at(-1) ?? today;
-    const funds = fundsOf(directory, asOf);
+    if (!fp) console.warn('[fund-returns] the app backend has no /funds yet: showing every AMFI fund');
+    const source: FundSource = fp ? 'fp' : 'amfi';
+    const funds = fp ? fpFundsOf(fp, directory) : fundsOf(directory, asOf);
     const navsByPeriod = new Map<PeriodKey, Map<string, { nav: number; date: string }>>();
     // Two at a time: each file is 1-6 MB.
     const queue = [...Periods];
     await Promise.all([0, 1].map(async () => {
       for (let p = queue.shift(); p; p = queue.shift()) {
         const on = minusMonths(asOf, p.months);
-        navsByPeriod.set(p.key, navsOn(await getText(HistoryUrl(addDays(on, -6), on), 90_000), on));
+        navsByPeriod.set(p.key, await navsAround(on));
       }
     }));
-    const result = { day: today, asOf, funds: buildReturns(funds, navsByPeriod) };
+    const result = { day: today, asOf, source, funds: buildReturns(funds, navsByPeriod) };
     cache = result;
     return result;
   })().finally(() => (loading = null));
@@ -120,7 +211,11 @@ export const FilterKeys = ['fundHouse', 'assetClass', 'category', 'plan', 'optio
 export type FilterKey = (typeof FilterKeys)[number];
 export type ReturnsQuery = { filters: Partial<Record<FilterKey, string[]>>; group: 'amc' | 'fund'; sort: string; dir: 'asc' | 'desc' };
 
-export type AmcRow = { fundHouse: string; funds: number; returns: Record<PeriodKey, number | null>; counts: Record<PeriodKey, number> };
+export type AmcRow = {
+  fundHouse: string; funds: number; returns: Record<PeriodKey, number | null>; counts: Record<PeriodKey, number>;
+  /** The earliest first NAV among its funds (FP funds only): why a long period can have no figure. */
+  since: string | null;
+};
 
 const mean = (xs: number[]) => (xs.length ? Math.round((xs.reduce((s, x) => s + x, 0) / xs.length) * 100) / 100 : null);
 
@@ -136,7 +231,8 @@ export function byAmc(funds: FundReturn[]): AmcRow[] {
       returns[p.key] = mean(xs);
       counts[p.key] = xs.length;
     }
-    return { fundHouse, funds: list.length, returns, counts };
+    const since = list.map((f) => f.since).filter((d): d is string => !!d).sort()[0] ?? null;
+    return { fundHouse, funds: list.length, returns, counts, since };
   });
 }
 
@@ -170,4 +266,7 @@ export function sortRows<T extends { returns: Record<PeriodKey, number | null> }
   });
 }
 
-export const Basis = 'Up to 1 year: the change in NAV. 3, 5 and 10 years: compounded a year (CAGR). An AMC’s figure is the simple average of its funds’ returns, each period over the funds old enough for it. Source: AMFI NAVs.';
+/** How the figures are worked out, for the screen and the files. */
+export const basis = (source: FundSource) =>
+  `${source === 'fp' ? 'Funds: every fund RiSips sells through FintechPrimitives.' : 'Funds: every fund AMFI lists (the app backend sent no fund list).'} `
+  + 'Up to 1 year: the change in NAV. 3, 5 and 10 years: compounded a year (CAGR). An AMC’s figure is the simple average of its funds’ returns, each period over the funds old enough for it. Source: AMFI NAVs.';
