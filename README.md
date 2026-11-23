@@ -116,6 +116,26 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   `client_master_report` (7-day windows, from `HUF_SYNC_FROM`, default 2026-10-01; tax status HUF) and added with
   `source = 'NSE'`, details from the client master and FATCA_REPORT. Once a day (last 14 days), and on "Sync from NSE".
 - **Active**: NSE's authorisation report is empty for HUFs, so staff mark a HUF active once an order is accepted.
+- **Companies** (private or public limited, `entity_type = 'COMPANY'`, client codes `RSPC…`) go through the same
+  routes, states, consent, approval, documents and investing. The differences, all verified on NSE UAT (member
+  1003364) on 23-24 Nov 2026:
+  - UCC: `tax_status 04` (reads back COMPANY). NSE checks the PAN's 4th character against it: a company PAN has `C`
+    ("INVALID 4th CHARACTER OF PRIMARY HOLDER PAN FOR GIVEN TAX STATUS" otherwise). A current account (`CB`).
+  - The authorised signatory takes the karta's place: consent, email, mobile, NSE's links. Designation and CIN are kept.
+  - FATCA: `tax_status 04`, `addr_type 4` (registered office), and the beneficial owners as UBO rows: 1-4 people with
+    their holding, or one senior managing official (`ubo_categ SMO`, designation in `ubo_smo_de`). A fifth row is
+    refused: 422 "Maximum 4 UBO records are allowed." A listed company sends `ubo_appl N` with `ubo_exch` and
+    `ubo_isin` and no rows. Every shape went in as REG_SUCCESS, also through the dashboard end to end.
+  - No eLog ("MEMBER IS NOT TRUSTED ALLOWING ONLY TRUSTED MEMBER."). A non-demat order without the AOF is refused
+    ("AOF IMAGE IS NOT PRESENT OR NOT VALID OR NOT VERIFIED."); with it, the next gate is the registrars' FATCA
+    ("FATCA IS NOT UPLOADED/ REJECTED BY RTA"), which UAT never sends on, so an order can't be proven on UAT.
+  - eNACH mandates register on a company's current account (`REG_SUCCESS`, `MANDATE_AUTH` link issued).
+  - Payment by NEFT/RTGS: `POST /hufs/:id/requests/:requestId/neft {utr}` calls `payments/purchase_payment` with
+    `payment_mode NEFT`. NSE's spec says `RTGS/NEFT`, but UAT refuses it ("payment_mode must be mandate, cheque, upi,
+    netbanking, neft"). Not proven past "client_code Status must be active" (UAT never activates a new client).
+  - The sync picks up `COMPANY`/`04` clients too, with their owners from FATCA_REPORT (one row per owner).
+  - Open with NSE: the UBO_CODE master (`C01` for owners is NSE's sample value), whether entity forms must also go by
+    post, and the KFin/CAMS review of entity FATCAs.
 - **Investments** ([src/nse/invest.ts](src/nse/invest.ts), [src/routes/huf-invest.ts](src/routes/huf-invest.ts)): orders
   (`ORDER_STATUS`, 7-day windows), allotments and redemptions (30-day windows), SIPs (`XSIP_REG_REPORT`) and mandates
   (`MANDATE_STATUS`) are read from NSE and kept in `hufs.investments`, again once a day on their own. NSE has no holdings

@@ -10,9 +10,9 @@ import { all, nowIso, one, run } from '../db.ts';
 import { HttpError, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
 import { hufInvestmentNotices } from '../notifications.ts';
-import type { HufDetails, NseStatus } from '../nse/huf.ts';
+import { entityWord, type HufDetails, type NseStatus } from '../nse/huf.ts';
 import {
-  placePurchase, productLink, purchaseProblem, readInvestments, readMandates, registerMandate, registerXsip,
+  payByNeft, placePurchase, productLink, purchaseProblem, readInvestments, readMandates, registerMandate, registerXsip,
   schemesFromNse, searchSchemes, sipProblem, type Investments, type Scheme,
 } from '../nse/invest.ts';
 import { unseal } from '../security.ts';
@@ -36,6 +36,8 @@ type Request = {
   linkError: string | null;
   at: string;
   by: string;
+  /** A purchase paid by NEFT/RTGS: the UTR sent to NSE and its answer. */
+  neft?: { utr: string; ok: boolean; status: string; remark: string | null; at: string; by: string } | null;
 };
 
 const requestsOf = (r: InvestRow): Request[] => (r.requests ? (JSON.parse(r.requests) as Request[]) : []);
@@ -57,12 +59,14 @@ const nseFailure = (error: unknown): never => {
  * money can only come from the HUF's own account, which NSE must have verified.
  */
 function investBlock(r: InvestRow): string | null {
+  const word = entityWord(unseal<HufDetails>(r.details));
+  const who = word === 'company' ? 'signatory' : 'karta';
   if (!nseConfigured() || (nseIsLive() && !config.nse.allowProd)) return 'NSE is not configured on this server.';
-  if (r.status !== 'ACTIVE' && r.status !== 'AWAITING_KARTA') return 'The HUF has to be registered on NSE first.';
+  if (r.status !== 'ACTIVE' && r.status !== 'AWAITING_KARTA') return `The ${word} has to be registered on NSE first.`;
   const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
-  if (nse?.bankStatus?.toUpperCase() !== 'ACTIVE') return "NSE hasn't verified the HUF's bank account yet. Refresh its status, or upload a cancelled cheque.";
+  if (nse?.bankStatus?.toUpperCase() !== 'ACTIVE') return `NSE hasn't verified the ${word}'s bank account yet. Refresh its status, or upload a cancelled cheque.`;
   const aofAccepted = nse.aof && [nse.aof.cams.status, nse.aof.kfin.status].includes('ACCEPTED');
-  if (!documentsOf(r).AOF?.ok && !aofAccepted) return 'Upload the AOF signed by the karta first: NSE needs it before a HUF can invest.';
+  if (!documentsOf(r).AOF?.ok && !aofAccepted) return `Upload the AOF signed by the ${who} first: NSE refuses a ${word}'s order without it ("AOF IMAGE IS NOT PRESENT OR NOT VALID OR NOT VERIFIED").`;
   return null;
 }
 
@@ -311,6 +315,28 @@ export function hufInvestRoutes(router: Router): void {
     await event(r.id, reg.ok ? 'SIP_REGISTERED' : 'SIP_FAILED', ctx.staff!.id, `${s.name}, ₹${amount} a month from ${startDate}, ${installments} instalments${reg.id ? `, ${reg.id}` : ''}${reg.remark ? `: ${reg.remark}` : ''}`);
     await audit(ctx, 'huf.sip', r.id, { schemeCode: s.schemeCode, amount, installments, startDate, regId: reg.id, ok: reg.ok, live: nseIsLive() });
     if (!reg.ok) throw HttpError.conflict(`NSE refused the SIP: ${reg.remark ?? reg.status}`);
+    return view(await load(r.id));
+  });
+
+  /**
+   * Pays a placed purchase by NEFT/RTGS with the bank's UTR, after the investor has transferred the money from its
+   * registered account. The way a company pays (NSE has no corporate net banking); a HUF can too.
+   */
+  router.post('/hufs/:id/requests/:requestId/neft', full, manage, async (ctx) => {
+    const r = await load(uuidParam(ctx, 'id'));
+    const list = requestsOf(r);
+    const q = list.find((x) => x.id === ctx.params['requestId']);
+    if (!q || q.kind !== 'PURCHASE' || !q.ok || !q.nseId) throw HttpError.notFound('That purchase could not be found.');
+    if (q.neft?.ok) throw HttpError.conflict(`This order is already paid by NEFT (UTR ${q.neft.utr}).`);
+    const utr = String(ctx.body?.utr ?? '').trim().toUpperCase();
+    if (!/^[A-Z0-9]{12,30}$/.test(utr)) throw HttpError.badRequest('Enter the UTR from the bank: 12 to 30 letters and digits (NEFT 16, RTGS 22).');
+    const d = unseal<HufDetails>(r.details);
+    const paid = await payByNeft(d.clientCode, q.nseId, utr).catch(nseFailure);
+    q.neft = { utr, ok: paid.ok, status: paid.status, remark: paid.remark, at: nowIso(), by: ctx.staff!.id };
+    await run('UPDATE hufs SET requests = ? WHERE id = ?', JSON.stringify(list), r.id);
+    await event(r.id, paid.ok ? 'NEFT_SUBMITTED' : 'NEFT_FAILED', ctx.staff!.id, `Order ${q.nseId}, UTR ${utr}${paid.remark ? `: ${paid.remark}` : ''}`);
+    await audit(ctx, 'huf.neft', r.id, { orderId: q.nseId, ok: paid.ok, live: nseIsLive() });
+    if (!paid.ok) throw HttpError.conflict(`NSE refused the payment: ${paid.remark ?? paid.status}`);
     return view(await load(r.id));
   });
 

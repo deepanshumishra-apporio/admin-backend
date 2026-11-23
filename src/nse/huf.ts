@@ -10,8 +10,30 @@ import { nsePost, trim } from './client.ts';
 
 export type Coparcener = { name: string; relationship: string; dateOfBirth: string | null };
 
-/** Everything needed to register a HUF. Kept encrypted in the admin database. Dates are yyyy-mm-dd. */
+/**
+ * The two kinds of non-individual this admin onboards. A company (private or public limited, tax status 04) goes
+ * through the same steps as a HUF; its "karta" is the authorised signatory, and its beneficial owners are listed.
+ */
+export const EntityTypes = ['HUF', 'COMPANY'] as const;
+export type EntityType = (typeof EntityTypes)[number];
+export const TaxStatus: Record<EntityType, string> = { HUF: '03', COMPANY: '04' };
+
+/**
+ * A company's beneficial owner as FATCA's UBO row wants it. UBO: a person owning or controlling more than 10%.
+ * SMO: the senior managing official, declared when no one crosses that line (NSE UAT accepted ubo_categ SMO with
+ * the designation in ubo_smo_de, 24 Nov 2026).
+ */
+export type Owner = {
+  name: string; pan: string; dateOfBirth: string; gender: 'M' | 'F' | 'O'; fatherName: string;
+  category: 'UBO' | 'SMO'; holdingPct: string; designation: string;
+};
+/** FATCA_COMMON takes at most 4 UBO rows: NSE UAT answers a fifth with 422 "Maximum 4 UBO records are allowed." */
+export const MaxOwners = 4;
+
+/** Everything needed to register a HUF or a company. Kept encrypted in the admin database. Dates are yyyy-mm-dd. */
 export type HufDetails = {
+  /** Absent on HUFs saved before companies existed. */
+  entityType?: EntityType;
   clientCode: string;
   hufName: string;
   pan: string;
@@ -36,12 +58,29 @@ export type HufDetails = {
   /** NSE's UCC state code, e.g. MA Maharashtra, UC Uttaranchal. */
   state: string;
   pincode: string;
+  /** HUF: the karta. Company: the authorised signatory, who consents and gets NSE's links and OTPs. */
   karta: { name: string; pan: string; dateOfBirth: string; gender: 'M' | 'F' | 'O'; fatherName: string };
   coparceners: Coparcener[];
+  /** Company only: the signatory's designation (e.g. DIRECTOR). */
+  signatoryDesignation?: string;
+  /** Company only: Corporate Identification Number, for our records (NSE's API has no field for it). */
+  cin?: string;
+  /** Company only: its beneficial owners, 1 to 4 rows; none when listed. */
+  owners?: Owner[];
+  /** Company only: listed on a stock exchange (or a subsidiary of a listed company), so no UBO rows. */
+  listed?: { exchange: 'B' | 'N'; isin: string } | null;
 };
+
+export const entityTypeOf = (d: Pick<HufDetails, 'entityType'>): EntityType => d.entityType ?? 'HUF';
+/** "HUF" or "company", for messages. */
+export const entityWord = (d: Pick<HufDetails, 'entityType'>): string => (entityTypeOf(d) === 'COMPANY' ? 'company' : 'HUF');
 
 export const IncomeSlabs = ['31', '32', '33', '34', '35', '36'] as const;
 const HufPan = /^[A-Z]{3}H[A-Z][0-9]{4}[A-Z]$/;
+/** NSE checks the 4th character against the tax status: "INVALID 4th CHARACTER OF PRIMARY HOLDER PAN FOR GIVEN TAX STATUS." */
+const CompanyPan = /^[A-Z]{3}C[A-Z][0-9]{4}[A-Z]$/;
+const Cin = /^[LU][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6}$/;
+const Isin = /^INE[A-Z0-9]{9}$/;
 const PersonPan = /^[A-Z]{3}P[A-Z][0-9]{4}[A-Z]$/;
 const Ifsc = /^[A-Z]{4}0[A-Z0-9]{6}$/;
 const Mobile = /^[6-9][0-9]{9}$/;
@@ -92,7 +131,20 @@ function age(iso: string): number {
 export function readHuf(body: any, { accountNoConfirm }: { accountNoConfirm?: unknown } = {}): { details: HufDetails; errors: Record<string, string> } {
   const b = body ?? {};
   const k = b.karta ?? {};
+  const type: EntityType = up(b.entityType) === 'COMPANY' ? 'COMPANY' : 'HUF';
+  const company = type === 'COMPANY';
+  const person = (p: any) => ({
+    name: up(p?.name).replace(/\s+/g, ' ').slice(0, 70),
+    pan: up(p?.pan),
+    dateOfBirth: isoDate(p?.dateOfBirth),
+    gender: (['M', 'F', 'O'].includes(up(p?.gender)) ? up(p?.gender) : '') as 'M',
+    fatherName: up(p?.fatherName).slice(0, 50),
+  });
+  const listed = company && b.listed && (b.listed.exchange || b.listed.isin)
+    ? { exchange: (up(b.listed.exchange) === 'B' ? 'B' : 'N') as 'B' | 'N', isin: up(b.listed.isin) }
+    : null;
   const details: HufDetails = {
+    entityType: type,
     clientCode: up(b.clientCode),
     hufName: up(b.hufName).replace(/\s+/g, ' '),
     pan: up(b.pan),
@@ -104,7 +156,8 @@ export function readHuf(body: any, { accountNoConfirm }: { accountNoConfirm?: un
     netWorthDate: isoDate(b.netWorthDate),
     email: text(b.email, 100).toLowerCase(),
     mobile: String(b.mobile ?? '').replace(/\D/g, ''),
-    accountType: b.accountType === 'CB' ? 'CB' : 'SB',
+    // A company banks on a current account; a HUF on either.
+    accountType: company || b.accountType === 'CB' ? 'CB' : 'SB',
     accountNo: String(b.accountNo ?? '').replace(/\s/g, ''),
     ifsc: up(b.ifsc),
     bankHolderName: up(b.bankHolderName),
@@ -114,49 +167,108 @@ export function readHuf(body: any, { accountNoConfirm }: { accountNoConfirm?: un
     city: up(b.city).slice(0, 35),
     state: up(b.state),
     pincode: String(b.pincode ?? '').trim(),
-    karta: {
-      name: up(k.name).replace(/\s+/g, ' ').slice(0, 70),
-      pan: up(k.pan),
-      dateOfBirth: isoDate(k.dateOfBirth),
-      gender: (['M', 'F', 'O'].includes(up(k.gender)) ? up(k.gender) : '') as 'M',
-      fatherName: up(k.fatherName).slice(0, 50),
-    },
-    coparceners: (Array.isArray(b.coparceners) ? b.coparceners : []).slice(0, 30).map((m: any) => ({
+    karta: person(k),
+    coparceners: company ? [] : (Array.isArray(b.coparceners) ? b.coparceners : []).slice(0, 30).map((m: any) => ({
       name: up(m?.name).slice(0, 70), relationship: up(m?.relationship).slice(0, 30), dateOfBirth: isoDate(m?.dateOfBirth) || null,
     })),
   };
+  if (company) {
+    details.signatoryDesignation = up(b.signatoryDesignation).slice(0, 40);
+    details.cin = up(b.cin);
+    details.listed = listed;
+    // Up to 6 rows are read so a fifth one is reported, not silently dropped.
+    details.owners = listed ? [] : (Array.isArray(b.owners) ? b.owners : []).slice(0, MaxOwners + 2).map((o: any) => ({
+      ...person(o),
+      category: up(o?.category) === 'SMO' ? 'SMO' : 'UBO',
+      holdingPct: String(o?.holdingPct ?? '').trim(),
+      designation: up(o?.designation).slice(0, 40),
+    }));
+  }
   const d = details;
+  const word = company ? 'company' : 'HUF';
+  const who = company ? 'signatory' : 'karta';
   const errors: Record<string, string> = {};
-  if (!/^[A-Z0-9]{1,10}$/.test(d.clientCode)) errors['clientCode'] = 'Client code must be 1-10 letters or digits (the HUF series is RSPH000001…).';
-  if (!/ HUF$/.test(d.hufName)) errors['hufName'] = 'Write the name as on the HUF PAN card, ending in "HUF" (e.g. RAJESH KUMAR HUF).';
-  if (!HufPan.test(d.pan)) errors['pan'] = "This must be the HUF's own PAN, with H as the 4th character.";
-  if (!d.formedOn || d.formedOn > todayIso()) errors['formedOn'] = 'Enter the date the HUF was formed (a past date).';
-  if (!d.placeOfFormation) errors['placeOfFormation'] = 'Enter the city where the HUF was formed.';
-  if (!d.natureOfBusiness) errors['natureOfBusiness'] = 'Enter the nature of business (e.g. BUSINESS, PHARMACY).';
+  if (!/^[A-Z0-9]{1,10}$/.test(d.clientCode)) {
+    errors['clientCode'] = `Client code must be 1-10 letters or digits (the ${word} series is ${company ? 'RSPC000001' : 'RSPH000001'}…).`;
+  }
+  if (company) {
+    if (d.hufName.length < 3) errors['hufName'] = "Write the company's registered name, as on its PAN card.";
+    else if (/ HUF$/.test(d.hufName)) errors['hufName'] = 'This looks like a HUF. Choose HUF as the type instead.';
+    if (!CompanyPan.test(d.pan)) errors['pan'] = "This must be the company's own PAN, with C as the 4th character.";
+    if (d.cin && !Cin.test(d.cin)) errors['cin'] = 'A CIN has 21 characters, like U72200MH2015PTC123456. Leave it blank if you don’t have it.';
+  } else {
+    if (!/ HUF$/.test(d.hufName)) errors['hufName'] = 'Write the name as on the HUF PAN card, ending in "HUF" (e.g. RAJESH KUMAR HUF).';
+    if (!HufPan.test(d.pan)) errors['pan'] = "This must be the HUF's own PAN, with H as the 4th character.";
+  }
+  if (!d.formedOn || d.formedOn > todayIso()) errors['formedOn'] = `Enter the date the ${company ? 'company was incorporated' : 'HUF was formed'} (a past date).`;
+  if (!d.placeOfFormation) errors['placeOfFormation'] = `Enter the city where the ${company ? 'company was incorporated' : 'HUF was formed'}.`;
+  if (!d.natureOfBusiness) errors['natureOfBusiness'] = 'Enter the nature of business (e.g. BUSINESS, SOFTWARE SERVICES).';
   if (!(IncomeSlabs as readonly string[]).includes(d.incomeSlab)) errors['incomeSlab'] = 'Choose an income slab.';
   if (!/^\d{1,13}(\.\d{1,2})?$/.test(d.netWorthLakhs)) errors['netWorthLakhs'] = 'Enter the net worth in lakhs (e.g. 40 or 56.95).';
   if (!d.netWorthDate || d.netWorthDate > todayIso()) errors['netWorthDate'] = 'Enter the date of the net worth figure (usually 31 March).';
-  if (!Email.test(d.email)) errors['email'] = "Enter the karta's email: NSE sends every authorisation link there.";
-  if (!Mobile.test(d.mobile)) errors['mobile'] = "Enter the karta's 10-digit mobile: NSE sends every OTP there.";
+  if (!Email.test(d.email)) errors['email'] = `Enter the ${who}'s email: NSE sends every authorisation link there.`;
+  if (!Mobile.test(d.mobile)) errors['mobile'] = `Enter the ${who}'s 10-digit mobile: NSE sends every OTP there.`;
   if (!/^\d{6,18}$/.test(d.accountNo)) errors['accountNo'] = 'Enter the bank account number (6-18 digits).';
   else if (accountNoConfirm !== undefined && String(accountNoConfirm ?? '').replace(/\s/g, '') !== d.accountNo) errors['accountNoConfirm'] = 'The two account numbers do not match.';
   if (!Ifsc.test(d.ifsc)) errors['ifsc'] = 'Enter a valid IFSC, like HDFC0001234.';
   if (!d.bankHolderName || !sameName(d.bankHolderName, d.hufName)) {
-    errors['bankHolderName'] = "The account must be in the HUF's name. NSE's bank check and every payment fail on the karta's personal account.";
+    errors['bankHolderName'] = company
+      ? "The current account must be in the company's name. NSE's bank check and every payment fail on anyone else's account."
+      : "The account must be in the HUF's name. NSE's bank check and every payment fail on the karta's personal account.";
   }
   if (!d.address1) errors['address1'] = 'Enter the address.';
   if (!d.city) errors['city'] = 'Enter the city.';
   if (!UccStates[d.state]) errors['state'] = 'Choose a state.';
   if (!/^\d{6}$/.test(d.pincode)) errors['pincode'] = 'Enter the 6-digit pincode.';
-  if (!d.karta.name) errors['karta.name'] = "Enter the karta's name.";
-  if (!PersonPan.test(d.karta.pan)) errors['karta.pan'] = "Enter the karta's personal PAN (P as the 4th character).";
-  else if (d.karta.pan === d.pan) errors['karta.pan'] = "The karta's PAN must differ from the HUF's.";
-  if (!d.karta.dateOfBirth || age(d.karta.dateOfBirth) < 18) errors['karta.dateOfBirth'] = 'The karta must be an adult. Enter their date of birth.';
-  if (!d.karta.gender) errors['karta.gender'] = "Choose the karta's gender.";
+  if (!d.karta.name) errors['karta.name'] = `Enter the ${who}'s name.`;
+  if (!PersonPan.test(d.karta.pan)) errors['karta.pan'] = `Enter the ${who}'s personal PAN (P as the 4th character).`;
+  else if (d.karta.pan === d.pan) errors['karta.pan'] = `The ${who}'s PAN must differ from the ${word}'s.`;
+  if (!d.karta.dateOfBirth || age(d.karta.dateOfBirth) < 18) errors['karta.dateOfBirth'] = `The ${who} must be an adult. Enter their date of birth.`;
+  if (!d.karta.gender) errors['karta.gender'] = `Choose the ${who}'s gender.`;
+  if (company && !d.signatoryDesignation) errors['signatoryDesignation'] = "Enter the signatory's designation (e.g. DIRECTOR).";
   d.coparceners.forEach((m, i) => {
     if (!m.name || !m.relationship) errors[`coparceners.${i}`] = `Co-parcener ${i + 1} needs a name and a relationship.`;
   });
+  if (company) readOwners(d, errors);
   return { details, errors };
+}
+
+/** A company's owners: 1 to 4 people with their holding, or one senior managing official; none when listed. */
+function readOwners(d: HufDetails, errors: Record<string, string>): void {
+  if (d.listed) {
+    if (!Isin.test(d.listed.isin)) errors['listed.isin'] = "Enter the listed company's ISIN, like INE002A01018.";
+    return;
+  }
+  const owners = d.owners ?? [];
+  if (!owners.length) {
+    errors['owners'] = 'Add the beneficial owners (everyone owning more than 10%), or the senior managing official if no one does.';
+    return;
+  }
+  if (owners.length > MaxOwners) errors['owners'] = `NSE takes at most ${MaxOwners} beneficial owners.`;
+  const smo = owners.filter((o) => o.category === 'SMO');
+  if (smo.length && owners.length > 1) errors['owners'] = 'Declare either the owners above 10%, or one senior managing official on their own: not both.';
+  let total = 0;
+  const seen = new Set<string>();
+  owners.forEach((o, i) => {
+    const at = `owners.${i}`;
+    const n = `Owner ${i + 1}`;
+    if (!o.name) errors[`${at}.name`] = `${n} needs a name.`;
+    if (!PersonPan.test(o.pan)) errors[`${at}.pan`] = `${n} needs a personal PAN (P as the 4th character).`;
+    else if (seen.has(o.pan)) errors[`${at}.pan`] = `${n} is listed twice.`;
+    seen.add(o.pan);
+    if (!o.dateOfBirth || age(o.dateOfBirth) < 18) errors[`${at}.dateOfBirth`] = `${n} needs a date of birth (an adult).`;
+    if (!o.gender) errors[`${at}.gender`] = `Choose ${n.toLowerCase()}'s gender.`;
+    if (!o.fatherName) errors[`${at}.fatherName`] = `${n} needs their father's name, as on their PAN.`;
+    if (o.category === 'SMO') {
+      if (!o.designation) errors[`${at}.designation`] = 'Enter the senior managing official’s designation (e.g. MANAGING DIRECTOR).';
+      o.holdingPct = '';
+    } else {
+      const pc = Number(o.holdingPct);
+      if (!/^\d{1,3}(\.\d{1,2})?$/.test(o.holdingPct) || !(pc > 0) || pc > 100) errors[`${at}.holdingPct`] = `${n} needs a holding between 0 and 100%.`;
+      else total += pc;
+    }
+  });
+  if (total > 100.001) errors['owners'] = `The holdings add up to ${Math.round(total * 100) / 100}%, more than 100%.`;
 }
 
 /** The karta's consent, recorded on the consent page: their own IP and the moment they agreed. */
@@ -181,7 +293,7 @@ export function hufUcc(d: HufDetails): Record<string, string> {
   return Object.assign(row, {
     client_code: d.clientCode,
     primary_holder_first_name: d.hufName, // the full HUF name, middle and last blank
-    tax_status: '03', // HUF
+    tax_status: TaxStatus[entityTypeOf(d)], // 03 HUF (reads back HUF), 04 company (reads back COMPANY)
     gender: '', // not a person
     primary_holder_dob_incorporation: dmy(d.formedOn), // NSE's DOB field holds the formation date
     occupation_code: '01', // Business
@@ -210,9 +322,27 @@ export function hufUcc(d: HufDetails): Record<string, string> {
 export function hufFatca(d: HufDetails, consent: Consent) {
   const k = d.karta;
   const state = UccStates[d.state]?.fatca ?? d.state;
+  const company = entityTypeOf(d) === 'COMPANY';
+  // One UBO row per person. The address is the entity's (as on the live HUFs, and accepted on UAT for companies).
+  const uboRow = (p: { name: string; pan: string; dateOfBirth: string; gender: string; fatherName: string }, extra: { categ: 'UBO' | 'SMO'; pc: string; smo: string }) => ({
+    ubo_name: p.name, ubo_pan: p.pan, ubo_nation: 'IN',
+    // UAT rejects a blank second line ("UBO Address 2 is required"); a one-line address repeats the city.
+    ubo_add1: d.address1, ubo_add2: d.address2 || d.city, ubo_add3: d.address3 || d.city,
+    ubo_city: d.city, ubo_pin: d.pincode, ubo_state: state, ubo_cntry: 'IN',
+    ubo_add_ty: '1', ubo_ctr: 'IN', ubo_tin: p.pan, ubo_id_ty: 'C', ubo_cob: 'IN',
+    ubo_dob: dmy(p.dateOfBirth), ubo_gender: p.gender, ubo_fr_nam: p.fatherName,
+    ubo_occ: '01', ubo_occ_ty: 'B', ubo_tel: '', ubo_mobile: d.mobile, ubo_code: config.nse.hufUboCode,
+    ubo_hol_pc: extra.pc, ubo_categ: extra.categ, ubo_pep_fl: 'N', ubo_email: d.email.toUpperCase().slice(0, 30), ubo_smo_de: extra.smo,
+  });
+  // HUF: the karta. Company: its owners (UAT 24 Nov 2026: 3 and 4 rows, and one SMO row, all REG_SUCCESS).
+  const ubos = company
+    ? (d.owners ?? []).map((o) => uboRow(o, { categ: o.category, pc: o.category === 'UBO' ? o.holdingPct : '', smo: o.category === 'SMO' ? o.designation : '' }))
+    : [uboRow(k, { categ: 'UBO', pc: '', smo: '' })];
+  // A listed company declares no owners: ubo_appl N with the exchange and ISIN (UAT REG_SUCCESS, 24 Nov 2026).
+  const listed = company && d.listed ? d.listed : null;
   return {
     pan_rp: d.pan, pekrn: '', inv_name: d.hufName, dob: dmy(d.formedOn), fr_name: '', sp_name: '',
-    tax_status: '03', data_src: 'E', addr_type: '1', po_bir_inc: d.placeOfFormation, co_bir_inc: 'IN',
+    tax_status: TaxStatus[entityTypeOf(d)], data_src: 'E', addr_type: company ? '4' : '1', po_bir_inc: d.placeOfFormation, co_bir_inc: 'IN',
     tax_res1: 'IN', tpin1: d.pan, id1_type: 'C',
     tax_res2: '', tpin2: '', id2_type: '', tax_res3: '', tpin3: '', id3_type: '', tax_res4: '', tpin4: '', id4_type: '',
     srce_wealt: '02', corp_servs: '04', inc_slab: d.incomeSlab, net_worth: d.netWorthLakhs, nw_date: dmy(d.netWorthDate),
@@ -221,20 +351,11 @@ export function hufFatca(d: HufDetails, consent: Consent) {
     giin_exemc: '', // "0" is rejected by the API although reports show it
     nffe_catg: 'A', act_nfe_sc: '01', // active non-financial entity
     nature_bus: d.natureOfBusiness, rel_listed: '', exch_name: 'O',
-    ubo_appl: 'Y', ubo_count: '1', sdf_flag: 'Y', ubo_df: 'Y',
+    ubo_appl: listed ? 'N' : 'Y', ubo_count: listed ? '' : String(ubos.length), sdf_flag: 'Y', ubo_df: listed ? 'N' : 'Y',
     aadhaar_rp: '', new_change: 'N', log_name: fatcaLogName(consent),
-    ubo_exch: '', ubo_isin: '', ubo_rel_li: '', // listed companies only
+    ubo_exch: listed?.exchange ?? '', ubo_isin: listed?.isin ?? '', ubo_rel_li: '', // listed companies only
     npo_form: 'N', npo_dcl: '', npo_rgno: '',
-    ubo_details: [{
-      ubo_name: k.name, ubo_pan: k.pan, ubo_nation: 'IN',
-      // UAT rejects a blank second line ("UBO Address 2 is required"); a one-line address repeats the city.
-      ubo_add1: d.address1, ubo_add2: d.address2 || d.city, ubo_add3: d.address3 || d.city,
-      ubo_city: d.city, ubo_pin: d.pincode, ubo_state: state, ubo_cntry: 'IN',
-      ubo_add_ty: '1', ubo_ctr: 'IN', ubo_tin: k.pan, ubo_id_ty: 'C', ubo_cob: 'IN',
-      ubo_dob: dmy(k.dateOfBirth), ubo_gender: k.gender, ubo_fr_nam: k.fatherName,
-      ubo_occ: '01', ubo_occ_ty: 'B', ubo_tel: '', ubo_mobile: d.mobile, ubo_code: config.nse.hufUboCode,
-      ubo_hol_pc: '', ubo_categ: 'UBO', ubo_pep_fl: 'N', ubo_email: d.email.toUpperCase().slice(0, 30), ubo_smo_de: '',
-    }],
+    ubo_details: listed ? [] : ubos,
   };
 }
 
@@ -357,7 +478,7 @@ export async function hufClientsOnNse(from: Date, to: Date): Promise<any[]> {
   for (let start = new Date(from); start <= to; start = new Date(start.getTime() + 7 * 86_400_000)) {
     const end = new Date(Math.min(start.getTime() + 6 * 86_400_000, to.getTime()));
     const body = await nsePost('reports/client_master_report', { from_date: reportDate(start), to_date: reportDate(end) });
-    found.push(...rows(body).filter((r) => /^(HUF|03)$/i.test(trim(r.tax_status))));
+    found.push(...rows(body).filter((r) => /^(HUF|03|COMPANY|04)$/i.test(trim(r.tax_status))));
   }
   return [...new Map(found.map((r) => [up(r.client_code), r])).values()];
 }
@@ -384,10 +505,23 @@ function uccState(value: unknown): string {
  * A HUF's details as NSE holds them. The karta is known only when FATCA was sent with them as beneficial owner;
  * the co-parceners never reach NSE. Missing pieces stay blank.
  */
-export function detailsFromNse(m: any, fatca: any | null): HufDetails {
+export function detailsFromNse(m: any, fatca: any | null, uboRows: any[] = fatca ? [fatca] : []): HufDetails {
   const isoFrom = (v: unknown) => isoDate(trim(v).slice(0, 10));
   const name = [m.primary_holder_first_name, m.primary_holder_middle_name, m.primary_holder_last_name].map(trim).filter(Boolean).join(' ');
+  const company = /^(COMPANY|04)$/i.test(trim(m.tax_status));
+  const gender = (v: unknown) => (['M', 'F', 'O'].includes(up(v)) ? up(v) : '') as 'M';
+  const extra: Partial<HufDetails> = company ? {
+    signatoryDesignation: '', cin: '',
+    listed: up(fatca?.ubo_appl) === 'N' && trim(fatca?.ubo_isin) ? { exchange: up(fatca?.ubo_exch) === 'B' ? 'B' : 'N', isin: up(fatca?.ubo_isin) } : null,
+    // FATCA_REPORT gives one row per owner of the same declaration.
+    owners: uboRows.filter((r) => trim(r.ubo_name)).slice(0, MaxOwners).map((r) => ({
+      name: up(r.ubo_name), pan: up(r.ubo_pan), dateOfBirth: isoFrom(r.ubo_dob), gender: gender(r.ubo_gender), fatherName: up(r.ubo_fr_nam),
+      category: up(r.ubo_categ) === 'SMO' ? 'SMO' : 'UBO', holdingPct: trim(r.ubo_hol_pc), designation: up(r.ubo_smo_de),
+    })),
+  } : {};
   return {
+    entityType: company ? 'COMPANY' : 'HUF',
+    ...extra,
     clientCode: up(m.client_code),
     hufName: up(name),
     pan: up(m.primary_holder_pan),
@@ -405,7 +539,8 @@ export function detailsFromNse(m: any, fatca: any | null): HufDetails {
     bankHolderName: up(m.cheque_name) || up(name),
     address1: up(m.address_1), address2: up(m.address_2), address3: up(m.address_3),
     city: up(m.city), state: uccState(m.state), pincode: trim(m.pincode),
-    karta: {
+    // A company's signatory never reaches NSE's reports (its UBO rows are the owners): staff fill it in.
+    karta: company ? { name: '', pan: '', dateOfBirth: '', gender: '' as 'M', fatherName: '' } : {
       name: up(fatca?.ubo_name), pan: up(fatca?.ubo_pan),
       dateOfBirth: isoFrom(fatca?.ubo_dob), gender: (['M', 'F', 'O'].includes(up(fatca?.ubo_gender)) ? up(fatca?.ubo_gender) : '') as 'M',
       fatherName: up(fatca?.ubo_fr_nam),

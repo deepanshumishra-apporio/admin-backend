@@ -1,4 +1,5 @@
-// HUF onboarding on NSE Invest. Staff prepare a HUF; the karta confirms the details and gives consent on a public
+// HUF and company onboarding on NSE Invest (a company is the same flow: its authorised signatory takes the karta's
+// place, and its beneficial owners go in FATCA). Staff prepare a HUF; the karta confirms the details and gives consent on a public
 // page (their own IP and time go to NSE as evidence); a second staff member approves; this server then registers it:
 // duplicate check -> UCC -> FATCA with the karta as beneficial owner. NSE's bank check and the karta's own
 // authorisation (CL_ACT link + OTP) follow, read back with "Refresh". See src/nse/huf.ts.
@@ -15,9 +16,9 @@ import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Route
 import { NseError, nseConfigured } from '../nse/client.ts';
 import { hufEventNotice, hufFatcaNotice } from '../notifications.ts';
 import {
-  authorisationLink, clientCodesForPan, detailsFromNse, DocumentKinds, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
+  authorisationLink, clientCodesForPan, detailsFromNse, DocumentKinds, EntityTypes, entityTypeOf, entityWord, MaxOwners, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
   readHuf, readStatus, registerUcc, resendAuthorisation, UccStates, uploadDocument, uploadFatca,
-  type Consent, type DocumentKind, type HufDetails, type NseResult, type NseStatus,
+  type Consent, type DocumentKind, type EntityType, type HufDetails, type NseResult, type NseStatus,
 } from '../nse/huf.ts';
 import { newId, seal, unseal } from '../security.ts';
 
@@ -37,6 +38,7 @@ export type Row = {
   documents: string | null;
   /** ADMIN: prepared here. NSE: registered on NSE directly (e.g. on its portal) and found by the sync. */
   source: 'ADMIN' | 'NSE';
+  entity_type: EntityType;
 };
 
 /** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
@@ -62,6 +64,9 @@ const panHash = (pan: string) => createHmac('sha256', config.dataKey).update(`hu
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
 const stepsOf = (r: Row): Steps => JSON.parse(r.steps) as Steps;
 const onNse = (r: Row) => Boolean(stepsOf(r).ucc?.ok);
+/** "HUF" or "company", and who acts for it ("karta" or "authorised signatory"), for messages. */
+const entityKind = (r: Row) => (r.entity_type === 'COMPANY' ? 'company' : 'HUF');
+const who = (r: Row) => (r.entity_type === 'COMPANY' ? 'authorised signatory' : 'karta');
 
 function consentOf(r: Row) {
   if (r.consent_at) return { state: 'GIVEN' as const, at: r.consent_at, ip: r.consent_ip, expiresAt: null };
@@ -75,6 +80,7 @@ function listItem(r: Row, names: StaffNames) {
   const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
   return {
     id: r.id,
+    entityType: r.entity_type ?? 'HUF',
     clientCode: r.client_code,
     hufName: r.huf_name,
     pan: r.pan_masked,
@@ -93,7 +99,10 @@ function listItem(r: Row, names: StaffNames) {
 /** Once a HUF is on NSE its details are shown masked: they can't be edited any more. */
 function shownDetails(d: HufDetails, full: boolean) {
   if (full) return d;
-  return { ...d, pan: mask(d.pan), accountNo: mask(d.accountNo), karta: { ...d.karta, pan: mask(d.karta.pan), dateOfBirth: d.karta.dateOfBirth.slice(0, 4) } };
+  return {
+    ...d, pan: mask(d.pan), accountNo: mask(d.accountNo), karta: { ...d.karta, pan: mask(d.karta.pan), dateOfBirth: d.karta.dateOfBirth.slice(0, 4) },
+    owners: d.owners?.map((o) => ({ ...o, pan: mask(o.pan), dateOfBirth: o.dateOfBirth.slice(0, 4) })),
+  };
 }
 
 /** What still stands between this HUF and an active NSE account, worded for the person who has to act. */
@@ -102,7 +111,7 @@ function problems(r: Row, nse: NseStatus | null): string[] {
   if (r.last_error && r.status === 'NSE_FAILED') out.push(r.last_error);
   const bank = nse?.bankStatus?.toUpperCase();
   if (bank && bank !== 'ACTIVE' && bank !== 'PENDING') {
-    out.push(`NSE's bank check: ${nse!.bankStatus}${nse!.bankRemark ? ` (${nse!.bankRemark})` : ''}. The account must be in the HUF's name.`);
+    out.push(`NSE's bank check: ${nse!.bankStatus}${nse!.bankRemark ? ` (${nse!.bankRemark})` : ''}. The account must be in the ${r.entity_type === 'COMPANY' ? "company's" : "HUF's"} name.`);
   }
   for (const [name, s] of Object.entries(nse?.fatca ?? {})) {
     if (s.status === 'REJECTED') out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the FATCA declaration${s.remark ? `: ${s.remark}` : ''}.`);
@@ -111,7 +120,9 @@ function problems(r: Row, nse: NseStatus | null): string[] {
   // An AOF uploaded on NSE's portal counts too: the registrars' verdict shows it is there.
   const aofOnNse = nse?.aof?.cams.status === 'ACCEPTED' || nse?.aof?.kfin.status === 'ACCEPTED';
   if ((r.status === 'AWAITING_KARTA' || r.status === 'ACTIVE') && !docs.AOF?.ok && !aofOnNse) {
-    out.push("Upload the AOF signed by the karta. For a non-demat order NSE checks an eLog or AOF is on file, and a HUF can't have an eLog.");
+    out.push(r.entity_type === 'COMPANY'
+      ? "Upload the AOF signed by the authorised signatory. NSE refuses a company's order without it, and a company can't have an eLog."
+      : "Upload the AOF signed by the karta. For a non-demat order NSE checks an eLog or AOF is on file, and a HUF can't have an eLog.");
   }
   for (const [name, s] of Object.entries(nse?.aof ?? {})) {
     if (typeof s === 'object' && s && 'status' in s && s.status === 'REJECTED') {
@@ -123,7 +134,7 @@ function problems(r: Row, nse: NseStatus | null): string[] {
 
 async function detail(id: string, ctx: Ctx) {
   const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-  if (!r) throw HttpError.notFound('That HUF could not be found.');
+  if (!r) throw HttpError.notFound('That client could not be found.');
   const names = await staffNames();
   const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
   const events = (await all<{ id: string; type: string; staff_id: string | null; note: string | null; created_at: string }>(
@@ -155,8 +166,8 @@ async function detail(id: string, ctx: Ctx) {
 /** Why this staff member can't approve now, or null when they can. */
 function approvalBlock(r: Row, ctx: Ctx): string | null {
   if (r.status !== 'CONSENTED' && r.status !== 'NSE_FAILED') return null;
-  if (!r.consent_at) return "The karta hasn't given consent yet.";
-  if (config.hufSecondApprover && r.created_by === ctx.staff!.id) return 'A colleague has to approve: you prepared this HUF.';
+  if (!r.consent_at) return r.entity_type === 'COMPANY' ? "The authorised signatory hasn't given consent yet." : "The karta hasn't given consent yet.";
+  if (config.hufSecondApprover && r.created_by === ctx.staff!.id) return `A colleague has to approve: you prepared this ${r.entity_type === 'COMPANY' ? 'company' : 'HUF'}.`;
   if (!nseConfigured()) return 'NSE is not configured on this server.';
   if (nseIsLive() && !config.nse.allowProd) return "This server points at NSE's live account, which is switched off (NSE_ALLOW_PROD).";
   return null;
@@ -173,23 +184,27 @@ async function readValid(ctx: Ctx, exceptId: string | null): Promise<HufDetails>
   const { details, errors } = readHuf(ctx.body, { accountNoConfirm: ctx.body?.accountNoConfirm });
   if (!errors['clientCode']) {
     const clash = await one<{ id: string }>('SELECT id FROM hufs WHERE client_code = ? AND id <> ?', details.clientCode, exceptId ?? '');
-    if (clash) errors['clientCode'] = 'Another HUF here already uses this client code.';
+    if (clash) errors['clientCode'] = 'Another client here already uses this client code.';
   }
   if (!errors['pan']) {
     const clash = await one<{ id: string; client_code: string }>(
       "SELECT id, client_code FROM hufs WHERE pan_hash = ? AND id <> ? AND status <> 'CANCELLED'", panHash(details.pan), exceptId ?? '',
     );
-    if (clash) errors['pan'] = `This HUF PAN is already being onboarded here (${clash.client_code}).`;
+    if (clash) errors['pan'] = `This ${entityWord(details)} PAN is already being onboarded here (${clash.client_code}).`;
   }
   if (Object.keys(errors).length) throw HttpError.badRequest('Some details need fixing.', { fields: errors });
   return details;
 }
 
-/** RSPH000001 and RSPH000002 were onboarded on NSE's portal before this; the series continues after them. */
-async function nextClientCode(): Promise<string> {
-  const codes = await all<{ client_code: string }>("SELECT client_code FROM hufs WHERE client_code LIKE 'RSPH%'");
-  const highest = Math.max(2, ...codes.map((c) => Number(c.client_code.slice(4)) || 0));
-  return `RSPH${String(highest + 1).padStart(6, '0')}`;
+/**
+ * HUFs are RSPH…, companies RSPC…. RSPH000001, RSPH000002 and RSPC000001 were onboarded on NSE's portal before
+ * this; each series continues after them.
+ */
+async function nextClientCode(type: EntityType = 'HUF'): Promise<string> {
+  const prefix = type === 'COMPANY' ? 'RSPC' : 'RSPH';
+  const codes = await all<{ client_code: string }>('SELECT client_code FROM hufs WHERE client_code LIKE ?', `${prefix}%`);
+  const highest = Math.max(type === 'COMPANY' ? 1 : 2, ...codes.map((c) => Number(c.client_code.slice(4)) || 0));
+  return `${prefix}${String(highest + 1).padStart(6, '0')}`;
 }
 
 /** Runs the NSE steps that haven't succeeded yet. Never throws for an NSE answer: the outcome is saved on the row. */
@@ -210,7 +225,7 @@ async function submit(r: Row, ctx: Ctx, allowNewClientCode: boolean): Promise<vo
       const codes = await clientCodesForPan(d.pan);
       steps.duplicateCheck = { at: nowIso(), codes };
       if (codes.length && !codes.includes(d.clientCode) && !allowNewClientCode) {
-        return await fail('Duplicate check', `NSE already has this HUF PAN as ${codes.join(', ')}. Use that code, or approve again choosing to create a new one.`);
+        return await fail('Duplicate check', `NSE already has this ${entityWord(d)} PAN as ${codes.join(', ')}. Use that code, or approve again choosing to create a new one.`);
       }
       const ucc = await registerUcc(d);
       // Our own earlier attempt may have gone through without us hearing back.
@@ -254,7 +269,7 @@ async function refreshOne(r: Row): Promise<void> {
   await run('UPDATE hufs SET nse_status = ?, status = ?, updated_at = ? WHERE id = ?', JSON.stringify(status), next, nowIso(), r.id);
   const before = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus).fatca : null;
   await hufFatcaNotice(r, before, status.fatca);
-  if (next === 'ACTIVE' && r.status !== 'ACTIVE') await event(r.id, 'ACTIVE', null, 'NSE reports the karta has authorised the account.');
+  if (next === 'ACTIVE' && r.status !== 'ACTIVE') await event(r.id, 'ACTIVE', null, `NSE reports the ${who(r)} has authorised the account.`);
   if (stepsOf(r).fatca?.ok && !r.auth_link) await fetchLink(r.id, d.clientCode);
 }
 
@@ -276,7 +291,10 @@ export function syncFromNse(since: Date = SyncFrom): Promise<{ found: number; im
     const imported: string[] = [];
     for (const c of fresh) {
       const pan = trim(c.primary_holder_pan).toUpperCase();
-      const d = detailsFromNse(c, fatca.find((f) => trim(f.pan_rp).toUpperCase() === pan) ?? null);
+      const declaration = fatca.find((f) => trim(f.pan_rp).toUpperCase() === pan) ?? null;
+      // A company's FATCA has one row per owner, all with the same time as the newest.
+      const uboRows = declaration ? fatca.filter((f) => trim(f.pan_rp).toUpperCase() === pan && f.createddatetime === declaration.createddatetime) : [];
+      const d = detailsFromNse(c, declaration, uboRows);
       const at = nseCreatedAt(c.created_at) ?? nowIso();
       const f = fatca.find((x) => trim(x.pan_rp).toUpperCase() === pan);
       const steps: Steps = {
@@ -286,9 +304,9 @@ export function syncFromNse(since: Date = SyncFrom): Promise<{ found: number; im
       };
       const id = newId();
       const added = await run(
-        `INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, created_by, source, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'AWAITING_KARTA', ?, NULL, 'NSE', ?, ?) ON CONFLICT (client_code) DO NOTHING`,
-        id, d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), JSON.stringify(steps), at, nowIso(),
+        `INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, created_by, source, entity_type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'AWAITING_KARTA', ?, NULL, 'NSE', ?, ?, ?) ON CONFLICT (client_code) DO NOTHING`,
+        id, d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), JSON.stringify(steps), entityTypeOf(d), at, nowIso(),
       );
       if (!added) continue;
       imported.push(d.clientCode);
@@ -356,6 +374,9 @@ function consentView(r: Row) {
     agreedAt: consent.at,
     expiresAt: r.consent_expires_at,
     huf: {
+      entityType: entityTypeOf(d), signatoryDesignation: d.signatoryDesignation ?? null, cin: d.cin || null,
+      owners: (d.owners ?? []).map((o) => ({ name: o.name, pan: mask(o.pan), category: o.category, holdingPct: o.holdingPct || null, designation: o.designation || null })),
+      listed: d.listed ?? null,
       name: d.hufName, pan: mask(d.pan), formedOn: d.formedOn, kartaName: d.karta.name, kartaPan: mask(d.karta.pan),
       email: d.email, mobile: mask(d.mobile, 4), bank: { ifsc: d.ifsc, accountNo: mask(d.accountNo), holder: d.bankHolderName },
       address: [d.address1, d.address2, d.address3, d.city, UccStates[d.state]?.name, d.pincode].filter(Boolean).join(', '),
@@ -370,6 +391,9 @@ export function hufRoutes(router: Router): void {
 
   router.get('/hufs/options', full, manage, async () => ({
     nextClientCode: await nextClientCode(),
+    nextClientCodes: { HUF: await nextClientCode('HUF'), COMPANY: await nextClientCode('COMPANY') },
+    entityTypes: EntityTypes,
+    maxOwners: MaxOwners,
     states: Object.entries(UccStates).map(([code, s]) => ({ code, name: s.name })).sort((a, b) => a.name.localeCompare(b.name)),
     incomeSlabs: IncomeSlabs.map((code, i) => ({ code, label: ['Below ₹1 lakh', '₹1-5 lakh', '₹5-10 lakh', '₹10-25 lakh', '₹25 lakh-1 crore', 'Above ₹1 crore'][i]! })),
     nse: { environment: nseIsLive() ? 'LIVE' : 'UAT', configured: nseConfigured(), liveAllowed: config.nse.allowProd },
@@ -392,14 +416,17 @@ export function hufRoutes(router: Router): void {
 
   router.get('/hufs', full, manage, async (ctx) => {
     const statuses = listParam(ctx.query, 'status', Statuses);
+    const types = listParam(ctx.query, 'type', EntityTypes);
     const search = ctx.query.get('search')?.trim().toLowerCase();
     const [rows, names] = await Promise.all([all<Row>('SELECT * FROM hufs ORDER BY updated_at DESC'), staffNames()]);
-    const items = rows
+    // HUFs and companies have their own screens: the status counts are for the type asked for.
+    const ofType = rows.filter((r) => !types.length || types.includes(r.entity_type ?? 'HUF'));
+    const items = ofType
       .filter((r) => !statuses.length || statuses.includes(r.status))
       .filter((r) => !search || [r.huf_name, r.client_code, r.karta_name, r.pan_masked].join(' ').toLowerCase().includes(search))
       .map((r) => listItem(r, names));
     const { offset, limit } = pageParams(ctx.query);
-    return { ...page(items, offset, limit), counts: Object.fromEntries(Statuses.map((s) => [s, rows.filter((r) => r.status === s).length])) };
+    return { ...page(items, offset, limit), counts: Object.fromEntries(Statuses.map((s) => [s, ofType.filter((r) => r.status === s).length])) };
   });
 
   router.post('/hufs', full, manage, async (ctx) => {
@@ -408,12 +435,12 @@ export function hufRoutes(router: Router): void {
     const now = nowIso();
     const empty: Steps = { duplicateCheck: null, ucc: null, fatca: null };
     await run(
-      `INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)`,
-      id, d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), JSON.stringify(empty), ctx.staff!.id, now, now,
+      `INSERT INTO hufs (id, client_code, huf_name, pan_masked, pan_hash, karta_name, details, status, steps, created_by, entity_type, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?)`,
+      id, d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), JSON.stringify(empty), ctx.staff!.id, entityTypeOf(d), now, now,
     );
     await event(id, 'CREATED', ctx.staff!.id);
-    await audit(ctx, 'huf.created', id, { clientCode: d.clientCode });
+    await audit(ctx, 'huf.created', id, { clientCode: d.clientCode, entityType: entityTypeOf(d) });
     return detail(id, ctx);
   });
 
@@ -422,19 +449,19 @@ export function hufRoutes(router: Router): void {
   router.put('/hufs/:id', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (onNse(r)) throw HttpError.conflict('This HUF is already registered on NSE. Changing it needs a UCC modification, which this screen does not do yet.');
-    if (r.status === 'CANCELLED' || r.status === 'SUBMITTING') throw HttpError.conflict('This HUF cannot be changed now.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (onNse(r)) throw HttpError.conflict(`This ${entityKind(r)} is already registered on NSE. Changing it needs a UCC modification, which this screen does not do yet.`);
+    if (r.status === 'CANCELLED' || r.status === 'SUBMITTING') throw HttpError.conflict(`This ${entityKind(r)} cannot be changed now.`);
     const d = await readValid(ctx, id);
     // The karta agreed to the details as they were; changed details need their consent again.
     const hadConsent = Boolean(r.consent_at || r.consent_token_hash);
     await run(
-      `UPDATE hufs SET client_code = ?, huf_name = ?, pan_masked = ?, pan_hash = ?, karta_name = ?, details = ?, status = 'DRAFT',
+      `UPDATE hufs SET client_code = ?, huf_name = ?, pan_masked = ?, pan_hash = ?, karta_name = ?, details = ?, entity_type = ?, status = 'DRAFT',
          consent_token_hash = NULL, consent_expires_at = NULL, consent_ip = NULL, consent_at = NULL, consent_user_agent = NULL,
          last_error = NULL, updated_at = ? WHERE id = ?`,
-      d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), nowIso(), id,
+      d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), entityTypeOf(d), nowIso(), id,
     );
-    await event(id, 'EDITED', ctx.staff!.id, hadConsent ? "Details changed: the karta's consent was cleared and is needed again." : null);
+    await event(id, 'EDITED', ctx.staff!.id, hadConsent ? `Details changed: the ${who(r)}'s consent was cleared and is needed again.` : null);
     await audit(ctx, 'huf.edited', id);
     return detail(id, ctx);
   });
@@ -443,8 +470,8 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/consent-link', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (r.status !== 'DRAFT' && r.status !== 'AWAITING_CONSENT') throw HttpError.conflict('The karta has already given consent, or the HUF is past that step.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (r.status !== 'DRAFT' && r.status !== 'AWAITING_CONSENT') throw HttpError.conflict(`The ${who(r)} has already given consent, or the ${entityKind(r)} is past that step.`);
     const token = randomBytes(32).toString('base64url');
     const expiresAt = new Date(Date.now() + ConsentDays * DayMs).toISOString();
     await run("UPDATE hufs SET consent_token_hash = ?, consent_expires_at = ?, status = 'AWAITING_CONSENT', updated_at = ? WHERE id = ?",
@@ -457,14 +484,14 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/approve', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (r.status !== 'CONSENTED' && r.status !== 'NSE_FAILED') throw HttpError.conflict('Only a HUF the karta has consented to can be sent to NSE.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (r.status !== 'CONSENTED' && r.status !== 'NSE_FAILED') throw HttpError.conflict(`Only a ${entityKind(r)} the ${who(r)} has consented to can be sent to NSE.`);
     const blocked = approvalBlock(r, ctx);
     if (blocked) throw HttpError.forbidden(blocked);
     // Claim it, so two approvals at once can't both register it.
     const claimed = await run("UPDATE hufs SET status = 'SUBMITTING', approved_by = ?, approved_at = ?, updated_at = ? WHERE id = ? AND status IN ('CONSENTED', 'NSE_FAILED')",
       ctx.staff!.id, nowIso(), nowIso(), id);
-    if (!claimed) throw HttpError.conflict('Someone else is sending this HUF to NSE right now.');
+    if (!claimed) throw HttpError.conflict(`Someone else is sending this ${entityKind(r)} to NSE right now.`);
     await event(id, 'APPROVED', ctx.staff!.id, nseIsLive() ? 'Sent to NSE (live)' : 'Sent to NSE UAT');
     await audit(ctx, 'huf.approved', id, { environment: nseIsLive() ? 'LIVE' : 'UAT' });
     try {
@@ -479,8 +506,8 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/refresh', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (!onNse(r)) throw HttpError.conflict('This HUF is not on NSE yet.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (!onNse(r)) throw HttpError.conflict(`This ${entityKind(r)} is not on NSE yet.`);
     try {
       await refreshOne(r);
     } catch (error) {
@@ -497,8 +524,8 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/documents', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (!onNse(r) || r.status === 'CANCELLED') throw HttpError.conflict('Documents go to NSE once the HUF is registered there.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (!onNse(r) || r.status === 'CANCELLED') throw HttpError.conflict(`Documents go to NSE once the ${entityKind(r)} is registered there.`);
     const kind = ctx.body?.kind as DocumentKind;
     if (!(DocumentKinds as readonly string[]).includes(kind)) throw HttpError.badRequest('Choose which document this is.');
     const contentType = String(ctx.body?.contentType ?? '');
@@ -536,8 +563,8 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/resend-link', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (!stepsOf(r).fatca?.ok) throw HttpError.conflict('NSE sends the karta a link only once the UCC and FATCA are in.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (!stepsOf(r).fatca?.ok) throw HttpError.conflict(`NSE sends the ${who(r)} a link only once the UCC and FATCA are in.`);
     let result: NseResult;
     try {
       result = await resendAuthorisation(r.client_code);
@@ -555,9 +582,9 @@ export function hufRoutes(router: Router): void {
     // NSE's authorisation report is empty for HUFs, so staff confirm it once an order has been accepted.
     const id = uuidParam(ctx, 'id');
     const note = typeof ctx.body?.note === 'string' ? ctx.body.note.trim().slice(0, 500) : '';
-    if (!note) throw HttpError.badRequest('Say how you know the karta has authorised it (e.g. an accepted order number).');
+    if (!note) throw HttpError.badRequest('Say how you know NSE has activated it (e.g. an accepted order number).');
     const done = await run("UPDATE hufs SET status = 'ACTIVE', updated_at = ? WHERE id = ? AND status = 'AWAITING_KARTA'", nowIso(), id);
-    if (!done) throw HttpError.conflict('Only a HUF waiting on the karta can be marked active.');
+    if (!done) throw HttpError.conflict('Only a client waiting on NSE activation can be marked active.');
     await event(id, 'ACTIVE', ctx.staff!.id, note);
     await audit(ctx, 'huf.marked_active', id, { note });
     return detail(id, ctx);
@@ -566,10 +593,10 @@ export function hufRoutes(router: Router): void {
   router.post('/hufs/:id/cancel', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
     const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
-    if (!r) throw HttpError.notFound('That HUF could not be found.');
-    if (onNse(r)) throw HttpError.conflict('This HUF is already registered on NSE and cannot be cancelled here.');
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (onNse(r)) throw HttpError.conflict(`This ${entityKind(r)} is already registered on NSE and cannot be cancelled here.`);
     const done = await run("UPDATE hufs SET status = 'CANCELLED', consent_token_hash = NULL, updated_at = ? WHERE id = ? AND status NOT IN ('CANCELLED', 'SUBMITTING')", nowIso(), id);
-    if (!done) throw HttpError.conflict('This HUF cannot be cancelled now.');
+    if (!done) throw HttpError.conflict(`This ${entityKind(r)} cannot be cancelled now.`);
     await event(id, 'CANCELLED', ctx.staff!.id);
     await audit(ctx, 'huf.cancelled', id);
     return detail(id, ctx);

@@ -6,7 +6,7 @@
 // karta's OTP (and, for a purchase, their payment from the HUF's own bank account) completes it.
 import { config } from '../config.ts';
 import { nsePost, trim } from './client.ts';
-import type { HufDetails, NseResult } from './huf.ts';
+import { entityWord, type HufDetails, type NseResult } from './huf.ts';
 
 const up = (v: unknown): string => String(v ?? '').trim().toUpperCase();
 const num = (v: unknown): number | null => {
@@ -275,7 +275,7 @@ export async function placePurchase(d: HufDetails, input: PurchaseInput, uniqueI
   const body = await nsePost('transaction/NORMAL', { transaction_details: [{
     order_ref_number: '', scheme_code: input.scheme.schemeCode, trxn_type: 'P', buy_sell_type: input.folio ? 'ADDITIONAL' : 'FRESH',
     client_code: d.clientCode, demat_physical: 'P', order_amount: String(input.amount), folio_no: input.folio ?? '',
-    remarks: 'HUF PURCHASE VIA RISIPS ADMIN', kyc_flag: 'Y', sub_broker_code: '', euin_number: e, euin_declaration: e ? 'Y' : 'N',
+    remarks: `${entityWord(d).toUpperCase()} PURCHASE VIA RISIPS ADMIN`, kyc_flag: 'Y', sub_broker_code: '', euin_number: e, euin_declaration: e ? 'Y' : 'N',
     min_redemption_flag: 'N', dpc_flag: 'Y', all_units: 'N', redemption_units: '', sub_broker_arn: config.nse.subBrokerArn,
     bank_ref_no: '', account_no: '', mobile_no: d.mobile, email: d.email.toUpperCase(), mandate_id: '', filler1: '', member_unique_id: uniqueId,
   }] });
@@ -283,6 +283,21 @@ export async function placePurchase(d: HufDetails, input: PurchaseInput, uniqueI
   if (!r) return { ok: false, status: 'NO_RESPONSE', remark: 'NSE sent an unexpected response.', orderId: null };
   const orderId = trim(r.trxn_order_id) || null;
   return { ok: trim(r.trxn_status) === 'TRXN SUCCESS' && Boolean(orderId), status: trim(r.trxn_status), remark: trim(r.trxn_remark) || null, orderId };
+}
+
+/**
+ * Pays a placed purchase by NEFT/RTGS: the investor has already sent the money from its registered account, and the
+ * UTR is the bank's reference for that transfer. Companies pay this way (NSE has no corporate net banking). NSE's
+ * spec says payment_mode RTGS/NEFT, but UAT refuses it: "payment_mode must be mandate, cheque, upi, netbanking, neft"
+ * (24 Nov 2026). NEFT covers RTGS too.
+ */
+export async function payByNeft(clientCode: string, orderId: string, utr: string): Promise<NseResult> {
+  const body = await nsePost('payments/purchase_payment', {
+    payment_mode: 'NEFT', client_code: clientCode, order_ids: orderId, mandate_id: '', bank_account_no: '', ifsc: '',
+    cheque_no: '', cheque_date: '', vpa: '', neft_rtgs_utr_no: utr, callback_url: '',
+  });
+  const status = trim(body?.status);
+  return { ok: /^success$/i.test(status), status: status || 'NO_RESPONSE', remark: trim(body?.remark) || null };
 }
 
 /** NSE's link for a product: PUR (order id), MANDATE_AUTH (mandate id), XSIP_REG (registration id). */
@@ -345,7 +360,7 @@ export async function registerXsip(d: HufDetails, i: SipInput, uniqueId: string)
   return regResult(await nsePost('registration/product/XSIP', { reg_data: [{
     amc_code: i.scheme.amcCode, sch_code: i.scheme.schemeCode, client_code: d.clientCode, trans_mode: 'P', dp_txn_mode: 'P',
     start_date: dmySlash(new Date(`${i.startDate}T00:00:00Z`)), frequency_type: 'MONTHLY', frequency_allowed: '1',
-    installment_amount: String(i.amount), status: '1', member_code: config.nse.memberCode, folio_no: '', sip_remarks: 'HUF SIP VIA RISIPS ADMIN',
+    installment_amount: String(i.amount), status: '1', member_code: config.nse.memberCode, folio_no: '', sip_remarks: `${entityWord(d).toUpperCase()} SIP VIA RISIPS ADMIN`,
     installment_no: String(i.installments), sub_broker_code: '', euin_number: e, euin_declaration: e ? 'Y' : 'N', dpc_flag: 'Y',
     first_order_today: 'N', sub_broker_arn: config.nse.subBrokerArn, end_date: '', primary_holder_mobile: d.mobile,
     primary_holder_email: d.email.toUpperCase(), step_up_required: 'N', step_up_start_date: '', step_up_end_date: '', step_up_frequency: '',
