@@ -77,3 +77,31 @@ test('instalments become typed rows that can be found and refreshed through thei
   // Nobody waits on the investor for a scheduled withdrawal.
   assert.equal(withdrawal!.view.flag, null);
 });
+
+test('Active SIPs status: bounced when the latest instalment failed, paused while skipping, ended plans by state', async () => {
+  const { sipStatusOf } = await import('../src/routes/sips.ts');
+  const plan = (state: string, installments: Record<string, unknown>[], extra: Record<string, unknown> = {}): UpOrder =>
+    ({ ...sip('successful', {}, state), installments, ...extra });
+  const ok = (day: string) => ({ state: 'successful', scheduled_on: day });
+  const bad = (day: string) => ({ state: 'failed', scheduled_on: day });
+  assert.equal(sipStatusOf(plan('active', [ok('2026-09-05'), ok('2026-10-05')])), 'ACTIVE');
+  assert.equal(sipStatusOf(plan('active', [ok('2026-09-05'), bad('2026-10-05')])), 'BOUNCED');
+  assert.equal(sipStatusOf(plan('active', [bad('2026-09-05'), ok('2026-10-05')])), 'ACTIVE', 'a later success clears it');
+  assert.equal(sipStatusOf(plan('active', [ok('2026-10-05')], { pause: { from: '2026-11-01', to: '2026-12-31' } })), 'PAUSED');
+  assert.equal(sipStatusOf(plan('awaiting_payment', [{ state: 'submitted', scheduled_on: '2026-11-20' }])), 'AWAITING_PAYMENT');
+  assert.equal(sipStatusOf(plan('cancelled', [bad('2026-10-05')])), 'CANCELLED');
+  assert.equal(sipStatusOf(plan('completed', [])), 'COMPLETED');
+  assert.equal(sipStatusOf(plan('failed', [])), 'FAILED');
+});
+
+test('transactions export: date ranges in India dates, the financial year from 1 April', async () => {
+  const { rangeDates } = await import('../src/routes/transactions.ts');
+  const at = Date.parse('2026-11-24T20:00:00+05:30');
+  assert.equal(rangeDates('current', at), null);
+  assert.deepEqual(rangeDates('today', at), { from: '2026-11-24', to: '2026-11-24' });
+  assert.deepEqual(rangeDates('last7', at), { from: '2026-11-18', to: '2026-11-24' });
+  assert.deepEqual(rangeDates('thisMonth', at), { from: '2026-11-01', to: '2026-11-24' });
+  assert.deepEqual(rangeDates('fy', at), { from: '2026-04-01', to: '2026-11-24' });
+  assert.deepEqual(rangeDates('fy', Date.parse('2027-02-10T10:00:00+05:30')), { from: '2026-04-01', to: '2027-02-10' });
+  assert.deepEqual(rangeDates('all', at), { from: null, to: null });
+});

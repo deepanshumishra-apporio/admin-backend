@@ -22,7 +22,7 @@ export type Row = Record<string, unknown>;
 const Tables = [
   'roles', 'staff', 'staff_roles', 'sessions', 'login_events', 'audit_log', 'id_map', 'tickets', 'ticket_messages',
   'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings', 'hufs', 'huf_events', 'notifications',
-  'notification_reads',
+  'notification_reads', 'huf_files',
 ];
 // Neon's pooled endpoint (PgBouncer) refuses a per-connection search_path, so queries name the schema themselves:
 // a table after FROM / JOIN / INTO / UPDATE is written `schema.table`.
@@ -302,6 +302,25 @@ ALTER TABLE hufs ADD COLUMN IF NOT EXISTS investments_read_at TEXT;
 ALTER TABLE hufs ADD COLUMN IF NOT EXISTS requests TEXT;
 -- HUF (tax status 03) or COMPANY (04): both go through the same onboarding.
 ALTER TABLE hufs ADD COLUMN IF NOT EXISTS entity_type TEXT NOT NULL DEFAULT 'HUF';
+-- Every document staff uploaded for a HUF or company, the file itself sealed (AES-256-GCM under ADMIN_DATA_KEY), so
+-- staff can open what was sent to NSE. Failed attempts are kept too, with NSE's answer.
+CREATE TABLE IF NOT EXISTS huf_files (
+  id TEXT PRIMARY KEY,
+  huf_id TEXT NOT NULL REFERENCES hufs(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  original_name TEXT,
+  content_type TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  data TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  remark TEXT,
+  uploaded_by TEXT REFERENCES staff(id),
+  uploaded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS huf_files_huf ON huf_files(huf_id, uploaded_at);
 CREATE TABLE IF NOT EXISTS huf_events (
   id TEXT PRIMARY KEY,
   huf_id TEXT NOT NULL REFERENCES hufs(id) ON DELETE CASCADE,

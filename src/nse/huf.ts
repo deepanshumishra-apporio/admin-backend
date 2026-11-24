@@ -69,6 +69,12 @@ export type HufDetails = {
   owners?: Owner[];
   /** Company only: listed on a stock exchange (or a subsidiary of a listed company), so no UBO rows. */
   listed?: { exchange: 'B' | 'N'; isin: string } | null;
+  /**
+   * How the entity's KYC was done: K KRA (the default, as on the live HUFs) or C CKYC (RSPC000001 is registered
+   * "CKYC COMPLIANT"). A CKYC client needs its 14-digit CKYC number.
+   */
+  kycType?: 'K' | 'C';
+  ckycNumber?: string;
 };
 
 export const entityTypeOf = (d: Pick<HufDetails, 'entityType'>): EntityType => d.entityType ?? 'HUF';
@@ -168,6 +174,8 @@ export function readHuf(body: any, { accountNoConfirm }: { accountNoConfirm?: un
     state: up(b.state),
     pincode: String(b.pincode ?? '').trim(),
     karta: person(k),
+    kycType: up(b.kycType) === 'C' ? 'C' : 'K',
+    ckycNumber: up(b.kycType) === 'C' ? String(b.ckycNumber ?? '').replace(/\s/g, '') : '',
     coparceners: company ? [] : (Array.isArray(b.coparceners) ? b.coparceners : []).slice(0, 30).map((m: any) => ({
       name: up(m?.name).slice(0, 70), relationship: up(m?.relationship).slice(0, 30), dateOfBirth: isoDate(m?.dateOfBirth) || null,
     })),
@@ -216,6 +224,7 @@ export function readHuf(body: any, { accountNoConfirm }: { accountNoConfirm?: un
       ? "The current account must be in the company's name. NSE's bank check and every payment fail on anyone else's account."
       : "The account must be in the HUF's name. NSE's bank check and every payment fail on the karta's personal account.";
   }
+  if (d.kycType === 'C' && !/^\d{14}$/.test(d.ckycNumber ?? '')) errors['ckycNumber'] = `Enter the ${word}'s 14-digit CKYC number.`;
   if (!d.address1) errors['address1'] = 'Enter the address.';
   if (!d.city) errors['city'] = 'Enter the city.';
   if (!UccStates[d.state]) errors['state'] = 'Choose a state.';
@@ -306,7 +315,9 @@ export function hufUcc(d: HufDetails): Record<string, string> {
     div_pay_mode: '02',
     address_1: d.address1, address_2: d.address2, address_3: d.address3, city: d.city, state: d.state, pincode: d.pincode, country: 'INDIA',
     email: d.email.toUpperCase(), communication_mode: 'E', indian_mobile_no: d.mobile,
-    primary_holder_kyc_type: 'K', // KRA KYC on the HUF PAN
+    // KRA (K) or CKYC (C) KYC on the entity's PAN; CKYC needs its number.
+    primary_holder_kyc_type: d.kycType === 'C' ? 'C' : 'K',
+    primary_holder_ckyc_number: d.kycType === 'C' ? d.ckycNumber ?? '' : '',
     aadhaar_updated: 'Y', paperless_flag: 'Z',
     mobile_declaration_flag: 'SE', email_declaration_flag: 'SE',
     nomination_opt: 'N', // a HUF cannot nominate
@@ -338,7 +349,9 @@ export function hufFatca(d: HufDetails, consent: Consent) {
   const ubos = company
     ? (d.owners ?? []).map((o) => uboRow(o, { categ: o.category, pc: o.category === 'UBO' ? o.holdingPct : '', smo: o.category === 'SMO' ? o.designation : '' }))
     : [uboRow(k, { categ: 'UBO', pc: '', smo: '' })];
-  // A listed company declares no owners: ubo_appl N with the exchange and ISIN (UAT REG_SUCCESS, 24 Nov 2026).
+  // A listed company declares no owners: ubo_appl N, ubo_df Y (an entity's declaration), with the exchange and ISIN.
+  // NSE's spec (v1.9.8) makes ubo_exch / ubo_isin apply only to that pair; with ubo_df N a registrar can read the
+  // exchange as missing, as KFin did for RSPH000001 ("MISSING/INVALID UBO_EXCH").
   const listed = company && d.listed ? d.listed : null;
   return {
     pan_rp: d.pan, pekrn: '', inv_name: d.hufName, dob: dmy(d.formedOn), fr_name: '', sp_name: '',
@@ -351,7 +364,7 @@ export function hufFatca(d: HufDetails, consent: Consent) {
     giin_exemc: '', // "0" is rejected by the API although reports show it
     nffe_catg: 'A', act_nfe_sc: '01', // active non-financial entity
     nature_bus: d.natureOfBusiness, rel_listed: '', exch_name: 'O',
-    ubo_appl: listed ? 'N' : 'Y', ubo_count: listed ? '' : String(ubos.length), sdf_flag: 'Y', ubo_df: listed ? 'N' : 'Y',
+    ubo_appl: listed ? 'N' : 'Y', ubo_count: listed ? '' : String(ubos.length), sdf_flag: 'Y', ubo_df: 'Y',
     aadhaar_rp: '', new_change: 'N', log_name: fatcaLogName(consent),
     ubo_exch: listed?.exchange ?? '', ubo_isin: listed?.isin ?? '', ubo_rel_li: '', // listed companies only
     npo_form: 'N', npo_dcl: '', npo_rgno: '',
@@ -415,6 +428,11 @@ export type NseStatus = {
   authorised: boolean | null;
   /** The signed account-opening form at CAMS and KFin, from NSE's AOF upload report; null until one is uploaded. */
   aof?: { cams: RegistrarStatus; kfin: RegistrarStatus; uploadedAt: string | null } | null;
+  /**
+   * NSE's own KYC check on the entity's PAN (reports/CLIENT_KYC_REPORT). NSE's FAQ: a non-demat client orders only
+   * once FATCA is present, an eLog or AOF exists and KYC is verified. Null when NSE reports nothing.
+   */
+  kyc?: { status: string; remark: string | null; failed: boolean } | null;
   checkedAt: string;
 };
 
@@ -430,12 +448,16 @@ function fatcaTime(value: unknown): number {
 export async function readStatus(clientCode: string, pan: string): Promise<NseStatus> {
   const today = new Date(Date.now() + 5.5 * 3_600_000);
   const ddmmyyyy = (d: Date) => d.toISOString().slice(0, 10).split('-').reverse().join('-');
-  const [master, auth, fatca, aof] = await Promise.all([
+  const [master, auth, fatca, aof, kycReport] = await Promise.all([
     nsePost('reports/client_master_report', { client_code: clientCode, PAN: '', from_date: '', to_date: '' }),
     nsePost('reports/CLIENT_AUTHORIZATION', { from_date: ddmmyyyy(new Date(today.getTime() - 7 * 86_400_000)), to_date: ddmmyyyy(today), client_code: clientCode }),
     nsePost('reports/FATCA_REPORT', { pan_pkern_no: pan, from_date: '', to_date: '' }),
     nsePost('reports/AOF_IMAGE_UPLOAD_REPORT', { client_code: clientCode, from_date: '', to_date: '' }),
+    // The KYC report is newer than the rest; a failure there must not hide the other statuses.
+    nsePost('reports/CLIENT_KYC_REPORT', { pan_no: '', client_code: clientCode, from_date: '', to_date: '' }).catch(() => null),
   ]);
+  const k = rows(kycReport).find((r) => up(r.client_code) === clientCode) ?? null;
+  const kycStatus = k ? trim(k.kyc_status) : '';
   // "18/01/2025 11:58 AM": no seconds, unlike FATCA_REPORT's times.
   const aofTime = (r: any) => fatcaTime(trim(r.created_at).replace(/(\d{2}:\d{2})( ?[AP]M)?$/i, '$1:00$2'));
   const o = rows(aof).filter((r) => up(r.client_code) === clientCode).sort((x, y) => aofTime(y) - aofTime(x))[0];
@@ -453,11 +475,15 @@ export async function readStatus(clientCode: string, pan: string): Promise<NseSt
     } : null,
     authorised: authStatus ? /SUCCESS|AUTHORI[SZ]E/i.test(authStatus) : null,
     aof: o ? { cams: aofStatus(o.cams_status, o.cams_reason), kfin: aofStatus(o.kfin_status, o.kfin_reason), uploadedAt: trim(o.created_at) || null } : null,
+    kyc: kycStatus ? { status: kycStatus, remark: trim(k.status_remark) || null, failed: kycFailed(kycStatus) } : null,
     checkedAt: new Date().toISOString(),
   };
 }
 
 /** A registrar's verdict on an uploaded AOF, e.g. "Uploaded - Ready to invest". */
+/** "KYC Check failed", "REJECTED", "ON HOLD", "NOT AVAILABLE": anything NSE won't take an order on. */
+export const kycFailed = (status: string): boolean => /FAIL|REJECT|HOLD|NOT ?(AVAILABLE|VERIFIED|FOUND)|INVALID|INCOMPLETE/i.test(status);
+
 function aofStatus(status: unknown, reason: unknown): RegistrarStatus {
   const s = up(status);
   const verdict = /REJECT|FAIL|INVALID|DISCREPAN/.test(s) ? 'REJECTED' : /READY|ACCEPT|SUCCESS|VERIFIED/.test(s) ? 'ACCEPTED' : !s ? 'NOT_SENT' : 'PENDING';
@@ -519,9 +545,14 @@ export function detailsFromNse(m: any, fatca: any | null, uboRows: any[] = fatca
       category: up(r.ubo_categ) === 'SMO' ? 'SMO' : 'UBO', holdingPct: trim(r.ubo_hol_pc), designation: up(r.ubo_smo_de),
     })),
   } : {};
+  // The master report reads the KYC type back as a word ("CKYC COMPLIANT") or a letter.
+  const kyc = up(m.primary_holder_kyc_type);
+  const ckyc = kyc === 'C' || kyc.startsWith('CKYC');
   return {
     entityType: company ? 'COMPANY' : 'HUF',
     ...extra,
+    kycType: ckyc ? 'C' : 'K',
+    ckycNumber: ckyc ? trim(m.primary_holder_ckyc_number) : '',
     clientCode: up(m.client_code),
     hufName: up(name),
     pan: up(m.primary_holder_pan),
@@ -562,6 +593,8 @@ export function nseCreatedAt(value: unknown): string | null {
 
 export const DocumentKinds = ['AOF', 'FATCA_FORM', 'CANCELLED_CHEQUE'] as const;
 export type DocumentKind = (typeof DocumentKinds)[number];
+/** NSE takes the AOF and the FATCA form as PDF, JPG or TIFF only (".png" → "Invalid file extension"); a cheque may be a PNG. */
+export const AcceptsPng: Record<DocumentKind, boolean> = { AOF: false, FATCA_FORM: false, CANCELLED_CHEQUE: true };
 export const DocumentTypes: Record<string, string> = {
   'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png', 'image/tiff': 'tif',
 };

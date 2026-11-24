@@ -19,6 +19,8 @@ import { sessionRoutes } from './routes/sessions.ts';
 import { staffRoutes } from './routes/staff.ts';
 import { supportRoutes } from './routes/support.ts';
 import { transactionRoutes } from './routes/transactions.ts';
+import { sipRoutes } from './routes/sips.ts';
+import { aumRoutes } from './routes/aum.ts';
 import { flushIds } from './security.ts';
 import { startValuationLoop } from './valuation.ts';
 
@@ -33,6 +35,8 @@ sessionRoutes(router);
 staffRoutes(router);
 investorRoutes(router);
 transactionRoutes(router);
+sipRoutes(router);
+aumRoutes(router);
 // Before reportRoutes: its /reports/:key would otherwise take /reports/fund-returns.
 fundReturnsReportRoutes(router);
 reportRoutes(router);

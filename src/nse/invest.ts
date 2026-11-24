@@ -285,6 +285,66 @@ export async function placePurchase(d: HufDetails, input: PurchaseInput, uniqueI
   return { ok: trim(r.trxn_status) === 'TRXN SUCCESS' && Boolean(orderId), status: trim(r.trxn_status), remark: trim(r.trxn_remark) || null, orderId };
 }
 
+export type RedeemInput = { scheme: Scheme; folio: string; amount: number | null; units: number | null; all: boolean };
+
+/** Why NSE would refuse this redemption, checked against the holding and the scheme master; null when it looks fine. */
+export function redeemProblem(input: RedeemInput, holding: Holding | undefined): string | null {
+  const { scheme, amount, units, all } = input;
+  if (!scheme.redemptionAllowed) return `${scheme.name} doesn't allow redemptions now.`;
+  if (!holding || holding.units <= 0) return 'There are no units of this fund in that folio.';
+  if (all) return null;
+  if ((amount === null) === (units === null)) return 'Enter an amount or a number of units, or choose all units.';
+  if (units !== null) {
+    if (!(units > 0)) return 'Enter the number of units.';
+    if (units > holding.units + 0.0005) return `The folio holds ${holding.units} units.`;
+    return null;
+  }
+  if (!(amount! > 0)) return 'Enter the amount.';
+  if (scheme.redemptionMinAmount && amount! < scheme.redemptionMinAmount) return `The minimum redemption in ${scheme.name} is ₹${scheme.redemptionMinAmount}.`;
+  if (holding.value !== null && amount! > holding.value) return `The holding is worth about ₹${holding.value}. Redeem all units instead.`;
+  return null;
+}
+
+/**
+ * transaction/NORMAL, a redemption (trxn_type R) from a folio: by amount, by units, or all units. Then NSE's RED link,
+ * where the investor authorises it; the money goes to the registered bank account.
+ */
+export async function placeRedemption(d: HufDetails, input: RedeemInput, uniqueId: string): Promise<NseResult & { orderId: string | null }> {
+  const e = euin();
+  const body = await nsePost('transaction/NORMAL', { transaction_details: [{
+    order_ref_number: '', scheme_code: input.scheme.schemeCode, trxn_type: 'R', buy_sell_type: '',
+    client_code: d.clientCode, demat_physical: 'P', folio_no: input.folio,
+    // all_units Y: amount and units blank. Otherwise exactly one of them.
+    order_amount: input.all || input.amount === null ? '' : String(input.amount),
+    redemption_units: input.all || input.units === null ? '' : String(input.units), all_units: input.all ? 'Y' : 'N',
+    remarks: `${entityWord(d).toUpperCase()} REDEMPTION VIA RISIPS ADMIN`, kyc_flag: 'Y', sub_broker_code: '', euin_number: e, euin_declaration: e ? 'Y' : 'N',
+    min_redemption_flag: 'N', dpc_flag: 'Y', sub_broker_arn: config.nse.subBrokerArn,
+    bank_ref_no: '', account_no: '', mobile_no: d.mobile, email: d.email.toUpperCase(), mandate_id: '', filler1: '', member_unique_id: uniqueId,
+  }] });
+  const r = Array.isArray(body?.transaction_details) ? body.transaction_details[0] : null;
+  if (!r) return { ok: false, status: 'NO_RESPONSE', remark: 'NSE sent an unexpected response.', orderId: null };
+  const orderId = trim(r.trxn_order_id) || null;
+  return { ok: trim(r.trxn_status) === 'TRXN SUCCESS' && Boolean(orderId), status: trim(r.trxn_status), remark: trim(r.trxn_remark) || null, orderId };
+}
+
+/** NSE's cancellation reasons (XSIP_CAN remarks are "<code>" or "13:(reason)"). */
+export const SipCancelReasons: Record<string, string> = {
+  '01': 'Non availability of funds', '02': 'Scheme not performing', '03': 'Service issue', '04': 'Load revised',
+  '05': 'Wish to invest in other schemes', '06': 'Change in fund manager', '07': 'Goal achieved', '08': 'Not comfortable with market volatility',
+  '09': 'Will restart the SIP after a few months', '10': 'Modifications in bank, mandate or date', '11': 'Decided to invest elsewhere',
+  '12': 'Not the right time to invest', '13': 'Other',
+};
+
+/** cancellation/XSIP_CAN for one SIP; NSE then sends the investor an XSIP_CAN link to authorise it. */
+export async function cancelXsip(clientCode: string, regNo: string, reason: string, other: string): Promise<NseResult> {
+  const remarks = reason === '13' ? `13:(${other.replace(/[()]/g, '').slice(0, 90)})` : reason;
+  const body = await nsePost('cancellation/XSIP_CAN', { can_data: [{ client_code: clientCode, xsip_reg_no: regNo, remarks }] });
+  const list = body?.reg_data ?? body?.can_data;
+  const r = Array.isArray(list) ? list[0] : null;
+  if (!r) return { ok: false, status: 'NO_RESPONSE', remark: 'NSE sent an unexpected response.' };
+  return { ok: trim(r.can_status) === 'CAN_SUCCESS', status: trim(r.can_status), remark: trim(r.can_remark) || null };
+}
+
 /**
  * Pays a placed purchase by NEFT/RTGS: the investor has already sent the money from its registered account, and the
  * UTR is the bank's reference for that transfer. Companies pay this way (NSE has no corporate net banking). NSE's
@@ -300,8 +360,12 @@ export async function payByNeft(clientCode: string, orderId: string, utr: string
   return { ok: /^success$/i.test(status), status: status || 'NO_RESPONSE', remark: trim(body?.remark) || null };
 }
 
-/** NSE's link for a product: PUR (order id), MANDATE_AUTH (mandate id), XSIP_REG (registration id). */
-export async function productLink(productType: 'PUR' | 'MANDATE_AUTH' | 'XSIP_REG', ref: string): Promise<{ link: string | null; error: string | null }> {
+/**
+ * NSE's link for a product: PUR / RED (order id), MANDATE_AUTH (mandate id), XSIP_REG / XSIP_CAN (registration id).
+ * The investor confirms each one there with an OTP.
+ */
+export type ProductType = 'PUR' | 'RED' | 'MANDATE_AUTH' | 'XSIP_REG' | 'XSIP_CAN';
+export async function productLink(productType: ProductType, ref: string): Promise<{ link: string | null; error: string | null }> {
   const body = await nsePost('reports/GET_LINK', { productType, productRefId: ref });
   const link = trim(body?.firstHolderLink) || null;
   return { link, error: link ? null : trim(body?.errorMessage) || 'NSE returned no link yet.' };

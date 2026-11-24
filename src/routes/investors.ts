@@ -1,5 +1,6 @@
 // Dashboard, the investor list and one investor's full record.
 import { actorOf, audit, authenticate, need } from '../auth.ts';
+import { all } from '../db.ts';
 import { Csv, HttpError, listParam, page, pageParams, toCsv, uuidParam, type Router } from '../http.ts';
 import { investorExtId, snapshot, type Snapshot } from '../investors.ts';
 import {
@@ -36,7 +37,9 @@ import {
 } from '../map.ts';
 import { uuidFor } from '../security.ts';
 import { investorDetail as fetchDetail, portfolio, type UpDetailResponse, type UpOrder } from '../upstream.ts';
-import { currentValues, valuationAsOf } from '../valuation.ts';
+import { AssetClasses, AssetClassLabels, currentBreakdowns, currentValues, valuationAsOf } from '../valuation.ts';
+import { monitored } from './transactions.ts';
+import type { Ctx } from '../http.ts';
 
 const DayMs = 86_400_000;
 
@@ -143,6 +146,162 @@ function summary(snap: Snapshot) {
   };
 }
 
+/** The India-local month ('YYYY-MM') of an instant, and the last `n` months ending with this one, oldest first. */
+const istMonth = (at: number): string => istDate(at).slice(0, 7);
+function lastMonths(n: number): string[] {
+  const [y, m] = istMonth(Date.now()).split('-').map(Number) as [number, number];
+  return Array.from({ length: n }, (_, i) => {
+    const d = new Date(Date.UTC(y, m - 1 - (n - 1 - i), 1));
+    return d.toISOString().slice(0, 7);
+  });
+}
+/** The first instant after an India-local month ends. */
+const monthEndMs = (month: string): number => {
+  const [y, m] = month.split('-').map(Number) as [number, number];
+  return Date.UTC(y, m, 1) - IstOffsetMs;
+};
+
+const EndedPlanStates = new Set(['cancelled', 'completed', 'expired']);
+const OpenTicketStates = ['OPEN', 'IN_PROGRESS', 'WAITING_ON_INVESTOR'];
+
+/** Money that moved, with when: successful lumpsum purchases, SIP instalments and redemptions. */
+function flows(snap: Snapshot) {
+  const out: { at: number; kind: 'LUMPSUM' | 'SIP' | 'REDEMPTION'; amount: number }[] = [];
+  for (const o of snap.orders) {
+    if (o.state !== 'successful' || (o.kind !== 'purchase' && o.kind !== 'redemption')) continue;
+    const at = ms(o.succeeded_at ?? o.traded_on ?? o.created_at);
+    const amount = Number(o.processed_amount ?? o.amount ?? 0);
+    if (at && amount) out.push({ at, kind: o.kind === 'purchase' ? 'LUMPSUM' : 'REDEMPTION', amount });
+  }
+  for (const p of snap.orders) {
+    if (p.kind !== 'sip' || !Array.isArray(p.installments)) continue;
+    for (const i of p.installments) {
+      if (i['state'] !== 'successful') continue;
+      const at = ms(i['succeeded_at'] ?? i['traded_on'] ?? i['scheduled_on'] ?? i['created_at']);
+      const amount = Number(i['amount'] ?? p.amount ?? 0);
+      if (at && amount) out.push({ at, kind: 'SIP', amount });
+    }
+  }
+  return out;
+}
+
+/**
+ * The overview the dashboard's first screen shows: business, investor and support figures, the AUM split by asset
+ * class, SIP and AUM trends, the work queues and the newest investors. Support and flagged-transaction counts are
+ * null for staff who can't see those areas.
+ */
+async function overview(snap: Snapshot, ctx: Ctx) {
+  const f = snap.facts.filter((x) => x.status !== 'DELETED');
+  const breakdowns = currentBreakdowns();
+  const now = Date.now();
+  const thisMonth = istMonth(now);
+  const active = (x: (typeof f)[number]) => x.currentValue > 0 || x.activeSips > 0;
+  const aum = f.reduce((s, x) => s + x.currentValue, 0);
+
+  const byClass = Object.fromEntries(AssetClasses.map((k) => [k, 0])) as Record<(typeof AssetClasses)[number], number>;
+  for (const x of f) {
+    const b = breakdowns.get(x.up.id);
+    if (b) for (const k of AssetClasses) byClass[k] += b.byClass[k];
+  }
+  const classified = AssetClasses.reduce((s, k) => s + byClass[k], 0);
+
+  const hufRows = await all<{ n: number }>("SELECT COUNT(*) AS n FROM hufs WHERE client_code LIKE 'RSPH%'");
+
+  // SIPs: started in each month, and running at its end (registered by then and not yet cancelled or finished).
+  const sips = snap.orders.filter((o) => o.kind === 'sip' && o.state !== 'failed' && o.state !== 'created');
+  const money = flows(snap);
+  const sipMonths = lastMonths(6).map((month) => {
+    const end = monthEndMs(month);
+    const inMonth = (at: number) => at > 0 && istMonth(at) === month;
+    return {
+      month,
+      started: sips.filter((p) => inMonth(ms(p.created_at))).length,
+      running: sips.filter((p) => ms(p.created_at) < end && (planActive(p) || (EndedPlanStates.has(p.state) && ms(p.updated_at) >= end))).length,
+      sipAmount: money0(money.filter((m) => m.kind === 'SIP' && inMonth(m.at)).reduce((s, m) => s + m.amount, 0)),
+      lumpsumAmount: money0(money.filter((m) => m.kind === 'LUMPSUM' && inMonth(m.at)).reduce((s, m) => s + m.amount, 0)),
+    };
+  });
+
+  // Past months: the net amount invested by each month's end (no market values were kept then). This month: AUM.
+  const aumMonths = lastMonths(12).map((month) => {
+    if (month === thisMonth) return { month, value: money0(aum), basis: 'MARKET_VALUE' as const };
+    const end = monthEndMs(month);
+    const net = money.filter((m) => m.at < end).reduce((s, m) => s + (m.kind === 'REDEMPTION' ? -m.amount : m.amount), 0);
+    return { month, value: money0(Math.max(0, net)), basis: 'NET_INVESTED' as const };
+  });
+
+  const perms = ctx.staff!.permissions;
+  let support: { open: number; escalated: number } | null = null;
+  if (perms.has('support.manage')) {
+    const tickets = await all<{ priority: string; sla_due_at: string }>(
+      `SELECT priority, sla_due_at FROM tickets WHERE status IN (${OpenTicketStates.map(() => '?').join(', ')})`, ...OpenTicketStates,
+    );
+    support = {
+      open: tickets.length,
+      escalated: tickets.filter((t) => t.priority === 'URGENT' || Date.parse(t.sla_due_at) < now).length,
+    };
+  }
+
+  const flagged = perms.has('transactions.read') ? monitored(snap).filter((r) => r.view.flag).length : null;
+  const monthAgo = now - 30 * DayMs;
+  let failedSipDebits = 0;
+  for (const p of snap.orders) {
+    if (p.kind !== 'sip' || !Array.isArray(p.installments)) continue;
+    for (const i of p.installments) {
+      if (i['state'] === 'failed' && ms(i['failed_at'] ?? i['scheduled_on'] ?? i['updated_at'] ?? p.updated_at) >= monthAgo) failedSipDebits += 1;
+    }
+  }
+
+  const folioOf = (x: (typeof f)[number]) =>
+    breakdowns.get(x.up.id)?.folios[0] ?? [...x.orders, ...x.plans].find((o) => o.folio)?.folio ?? null;
+
+  return {
+    business: {
+      aum: money0(aum),
+      activeSips: f.reduce((s, x) => s + x.activeSips, 0),
+      activeInvestors: f.filter(active).length,
+    },
+    investors: {
+      total: f.length,
+      newThisMonth: f.filter((x) => istMonth(ms(x.up.signed_up_at)) === thisMonth).length,
+      newLast30Days: f.filter((x) => ms(x.up.signed_up_at) >= monthAgo).length,
+      pendingKyc: f.filter((x) => x.kycStatus === 'NOT_STARTED' || x.kycStatus === 'IN_PROGRESS').length,
+      kycRejections: f.filter((x) => x.kycStatus === 'FAILED' || x.kycStatus === 'EXPIRED' || x.kycStatus === 'PAN_CHECK_FAILED').length,
+      families: f.filter((x) => x.accountType === 'HUF').length + Number(hufRows[0]?.n ?? 0),
+      elssInvestors: f.filter((x) => breakdowns.get(x.up.id)?.elss).length,
+      active: f.filter(active).length,
+      inactive: f.filter((x) => !active(x)).length,
+    },
+    support,
+    assetClasses: AssetClasses.map((key) => ({
+      key,
+      label: AssetClassLabels[key],
+      value: money0(byClass[key]),
+      share: classified > 0 ? Math.round((byClass[key] / classified) * 1000) / 10 : 0,
+    })),
+    sipMonths,
+    aumMonths,
+    queues: {
+      failedSipDebits,
+      kycPending: f.filter((x) => x.kycStatus === 'NOT_STARTED' || x.kycStatus === 'IN_PROGRESS').length,
+      flaggedTransactions: flagged,
+    },
+    recentInvestors: [...f]
+      .sort((a, b) => ms(b.up.signed_up_at) - ms(a.up.signed_up_at))
+      .slice(0, 5)
+      .map((x) => ({
+        id: x.id,
+        name: x.up.name,
+        pan: x.up.pan_masked,
+        folio: folioOf(x),
+        aum: money0(x.currentValue),
+        status: x.status === 'DELETION_REQUESTED' ? 'DELETION_REQUESTED' : active(x) ? 'ACTIVE' : 'INACTIVE',
+        signedUpAt: iso(x.up.signed_up_at),
+      })),
+    valuedAt: valuationAsOf(),
+  };
+}
+
 function bucketStart(date: string, bucket: string): string {
   if (bucket === 'month') return `${date.slice(0, 7)}-01`;
   if (bucket === 'week') {
@@ -197,7 +356,10 @@ const ExportColumns = [
 export function investorRoutes(router: Router): void {
   const full = authenticate('full');
 
-  router.get('/dashboard/summary', full, need('dashboard.read'), async (ctx) => summary(await snapshot(ctx)));
+  router.get('/dashboard/summary', full, need('dashboard.read'), async (ctx) => {
+    const snap = await snapshot(ctx);
+    return { ...summary(snap), overview: await overview(snap, ctx) };
+  });
 
   router.get('/dashboard/signups', full, need('dashboard.read'), async (ctx) => {
     const snap = await snapshot(ctx);

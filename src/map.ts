@@ -465,6 +465,10 @@ export type MonitorRow = {
   payment: UpOrder['payment'] | null;
   amount: number;
   search: string;
+  /** FP's order reference (#MF…) or id, as staff quote it. */
+  reference: string;
+  /** How it was paid: UPI (the ONDC checkout is UPI only), AutoPay (a SIP instalment debit), or null (a sale). */
+  paymentMode: 'UPI' | 'AutoPay' | null;
 };
 
 export function monitorOrder(o: UpOrder, f: Facts | undefined): MonitorRow {
@@ -476,6 +480,8 @@ export function monitorOrder(o: UpOrder, f: Facts | undefined): MonitorRow {
     updatedMs: ms(o.updated_at),
     payment: o.payment ?? null,
     amount: Number(o.amount ?? 0),
+    reference: o.ref ?? o.id,
+    paymentMode: o.kind === 'purchase' ? 'UPI' : null,
     search: [o.ref, o.id, o.isin, o.folio, view.scheme, view.investor.name, view.investor.pan].filter(Boolean).join(' ').toLowerCase(),
   };
 }
@@ -532,6 +538,8 @@ export function monitorInstallments(plan: UpOrder, f: Facts | undefined, now = D
       updatedMs,
       payment: null,
       amount: Number(amount ?? 0),
+      reference: extId,
+      paymentMode: planKind === 'sip' ? (upfront ? 'UPI' : 'AutoPay') : null,
       search: [extId, plan.id, plan.ref, plan.isin, view.folio, view.scheme, view.investor.name, view.investor.pan].filter(Boolean).join(' ').toLowerCase(),
     };
   });

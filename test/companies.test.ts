@@ -65,6 +65,9 @@ function fakeNse(path: string, body: any) {
         camsuploadstatus: 'NOT UPLOADED', camsresponsestatus: 'PENDING', kfinuploadstatus: 'NOT UPLOADED', kfinresponsestatus: 'PENDING' },
     ] });
     case 'reports/AOF_IMAGE_UPLOAD_REPORT': return reply({ response_status: 'F', error_remark: 'No record(s) found.' });
+    case 'reports/CLIENT_KYC_REPORT': return reply(body.client_code === 'RSPC000001'
+      ? { response_status: 'S', report_data: [{ client_code: 'RSPC000001', client_pan: 'BBBCB1234B', kyc_status: 'KYC Check failed', status_remark: 'NOT AVAILABLE AT KRA' }] }
+      : { response_status: 'F', error_remark: 'No record(s) found.' });
     case 'payments/purchase_payment': return reply({ ...body, status: 'Success', remark: 'Payment details updated.' });
     default: return Promise.reject(new Error(`unexpected NSE call ${path}`));
   }
@@ -130,6 +133,11 @@ test('company rules: C PAN, current account in its name, signatory, 1-4 owners w
   assert.deepEqual(readHuf({ ...company, owners: [{ ...owner('Sunil Verma', 'ABCPV1234K', ''), category: 'SMO', designation: 'Managing Director' }] }).errors, {});
   assert.deepEqual(readHuf({ ...company, owners: [], listed: { exchange: 'N', isin: 'INE002A01018' } }).errors, {});
   assert.ok(readHuf({ ...company, listed: { exchange: 'N', isin: 'XYZ' } }).errors['listed.isin']);
+  // KYC: KRA by default; CKYC needs the 14-digit number.
+  assert.equal(readHuf(company).details.kycType, 'K');
+  assert.ok(readHuf({ ...company, kycType: 'C' }).errors['ckycNumber']);
+  assert.ok(readHuf({ ...company, kycType: 'C', ckycNumber: '12345' }).errors['ckycNumber']);
+  assert.deepEqual(readHuf({ ...company, kycType: 'C', ckycNumber: '1234 5678 9012 34' }).errors, {});
 });
 
 test('UCC and FATCA bodies for a company, as NSE UAT accepted them', () => {
@@ -139,6 +147,11 @@ test('UCC and FATCA bodies for a company, as NSE UAT accepted them', () => {
   assert.equal(ucc['account_type_1'], 'CB');
   assert.equal(ucc['primary_holder_first_name'], 'TESTCO PRIVATE LIMITED');
   assert.equal(ucc['primary_holder_dob_incorporation'], '01/04/2015');
+  assert.equal(ucc['primary_holder_kyc_type'], 'K');
+  assert.equal(ucc['primary_holder_ckyc_number'], '');
+  const ckycUcc = hufUcc(readHuf({ ...company, kycType: 'C', ckycNumber: '12345678901234' }).details);
+  assert.equal(ckycUcc['primary_holder_kyc_type'], 'C');
+  assert.equal(ckycUcc['primary_holder_ckyc_number'], '12345678901234');
   const fatca = hufFatca(details, consent);
   assert.equal(fatca.tax_status, '04');
   assert.equal(fatca.addr_type, '4', 'registered office');
@@ -154,7 +167,7 @@ test('UCC and FATCA bodies for a company, as NSE UAT accepted them', () => {
 
   const listed = hufFatca(readHuf({ ...company, owners: [], listed: { exchange: 'N', isin: 'INE002A01018' } }).details, consent);
   assert.equal(listed.ubo_appl, 'N');
-  assert.equal(listed.ubo_df, 'N');
+  assert.equal(listed.ubo_df, 'Y'); // NSE spec: ubo_exch / ubo_isin apply to ubo_appl N with ubo_df Y
   assert.equal(listed.ubo_exch, 'N');
   assert.equal(listed.ubo_isin, 'INE002A01018');
   assert.equal(listed.ubo_details.length, 0);
@@ -218,6 +231,55 @@ test('a company registered on NSE directly is found with its owners', async () =
   assert.equal(d.entityType, 'COMPANY');
   assert.deepEqual(d.owners.map((o: any) => [o.name, o.holdingPct]), [['OWNER ONE', '60'], ['OWNER TWO', '40']]);
   assert.equal(d.karta.name, '', 'the signatory is not in NSE’s reports');
+});
+
+test('a FATCA correction on a client already on NSE: consent and approval again, then only FATCA is re-sent', async () => {
+  const row = await one<{ id: string }>("SELECT id FROM hufs WHERE client_code = 'RSPC000001'");
+  const id = row!.id;
+  let r = await call('asha', 'POST', `/hufs/${id}/refresh`);
+  assert.equal(r.json.data.nse.kyc.status, 'KYC Check failed');
+  assert.ok(r.json.data.problems.some((p: string) => /KYC check/.test(p) && /NOT AVAILABLE AT KRA/.test(p)), JSON.stringify(r.json.data.problems));
+  assert.equal(r.json.data.canCorrectFatca, true);
+  assert.equal(r.json.data.canRequestConsent, false, 'no consent link for a client on NSE until a correction starts');
+
+  // The signatory was missing on NSE's record; owners come back masked from the screen and keep their saved PANs.
+  const shown = r.json.data.details;
+  const correction = {
+    karta: { name: 'Sunil Rao', pan: 'ABCPR1234K', dateOfBirth: '1975-02-01', gender: 'M', fatherName: 'Raman Rao' },
+    signatoryDesignation: 'Director', placeOfFormation: 'Mumbai', natureOfBusiness: 'Trading', incomeSlab: '35', netWorthLakhs: '120', netWorthDate: '2026-03-31',
+    owners: shown.owners.map((o: any) => ({ ...o, fatherName: 'Father Name' })), pan: 'ZZZCZ9999Z', clientCode: 'HACK',
+  };
+  r = await call('asha', 'PUT', `/hufs/${id}/fatca`, { ...correction, karta: { ...correction.karta, pan: 'BAD' } });
+  assert.equal(r.status, 400);
+  assert.ok(r.json.error.details?.fields?.['karta.pan'] ?? r.json.error.fields?.['karta.pan'], JSON.stringify(r.json));
+  r = await call('asha', 'PUT', `/hufs/${id}/fatca`, correction);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.data.status, 'DRAFT');
+  assert.equal(r.json.data.canRequestConsent, true);
+  assert.equal(r.json.data.canCorrectFatca, false);
+  assert.equal(r.json.data.clientCode, 'RSPC000001', 'identity is not part of a correction');
+  const saved = unseal<any>((await one<{ details: string }>('SELECT details FROM hufs WHERE id = ?', id))!.details);
+  assert.equal(saved.pan, 'BBBCB1234B');
+  assert.deepEqual(saved.owners.map((o: any) => o.pan), ['AAAPO1111A', 'AAAPT2222B'], 'masked PANs keep the saved ones');
+  assert.equal(saved.karta.name, 'SUNIL RAO');
+
+  // A status refresh in between must not make it active again.
+  r = await call('asha', 'POST', `/hufs/${id}/refresh`);
+  assert.equal(r.json.data.status, 'DRAFT');
+
+  const token = (await call('asha', 'POST', `/hufs/${id}/consent-link`)).json.data.token as string;
+  await call(null, 'POST', `/public/huf-consent/${token}`, { agree: true }, { 'x-forwarded-for': '198.51.100.9' });
+  const uccBefore = calls.filter((c) => c.path === 'registration/CLIENTCOMMON').length;
+  r = await call('vikram', 'POST', `/hufs/${id}/approve`);
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.data.status, 'AWAITING_KARTA');
+  assert.equal(calls.filter((c) => c.path === 'registration/CLIENTCOMMON').length, uccBefore, 'the UCC is not sent again');
+  const fatca = calls.filter((c) => c.path === 'registration/FATCA_COMMON').at(-1)!.body.reg_details[0];
+  assert.equal(fatca.pan_rp, 'BBBCB1234B');
+  assert.equal(fatca.ubo_count, '2');
+  assert.equal(fatca.nature_bus, 'TRADING');
+  assert.match(fatca.log_name, /^198\.51\.100\.9 /, 'the new consent goes to NSE');
+  assert.equal(r.json.data.steps.fatcaCorrection, null);
 });
 
 test("NEFT payment sends NSE's accepted mode value and the UTR", async () => {

@@ -12,11 +12,11 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { audit, authenticate, need, refOf, staffNames, type StaffNames } from '../auth.ts';
 import { config, nseIsLive } from '../config.ts';
 import { all, nowIso, one, run } from '../db.ts';
-import { HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
+import { Download, HttpError, listParam, page, pageParams, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
 import { hufEventNotice, hufFatcaNotice } from '../notifications.ts';
 import {
-  authorisationLink, clientCodesForPan, detailsFromNse, DocumentKinds, EntityTypes, entityTypeOf, entityWord, MaxOwners, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
+  authorisationLink, clientCodesForPan, detailsFromNse, AcceptsPng, DocumentKinds, EntityTypes, entityTypeOf, entityWord, MaxOwners, DocumentTypes, fatcaRowsFor, hufClientsOnNse, IncomeSlabs, nseCreatedAt,
   readHuf, readStatus, registerUcc, resendAuthorisation, UccStates, uploadDocument, uploadFatca,
   type Consent, type DocumentKind, type EntityType, type HufDetails, type NseResult, type NseStatus,
 } from '../nse/huf.ts';
@@ -28,7 +28,20 @@ const ConsentDays = 7;
 const DayMs = 86_400_000;
 
 type Step = (NseResult & { at: string }) | null;
-type Steps = { duplicateCheck: { at: string; codes: string[] } | null; ucc: Step; fatca: Step };
+/**
+ * fatcaCorrection: a corrected FATCA for a client already on NSE (e.g. after a registrar rejected it). It goes through
+ * consent and approval again; approval then re-sends only FATCA_COMMON and puts the client back where it was.
+ */
+type Steps = {
+  duplicateCheck: { at: string; codes: string[] } | null; ucc: Step; fatca: Step;
+  fatcaCorrection?: { from: Status; at: string; by: string } | null;
+};
+
+/** What a FATCA correction may change; the identity, bank and contact details stay as registered (UCC). */
+const FatcaFields = ['formedOn', 'placeOfFormation', 'natureOfBusiness', 'incomeSlab', 'netWorthLakhs', 'netWorthDate', 'karta', 'owners', 'listed', 'signatoryDesignation'] as const;
+const fatcaError = (key: string) => FatcaFields.some((f) => key === f || key.startsWith(`${f}.`));
+/** Days NSE may take to send a FATCA on to CAMS and KFin before staff should raise it with NSE support. */
+const FatcaForwardDays = 5;
 
 export type Row = {
   id: string; client_code: string; huf_name: string; pan_masked: string; pan_hash: string; karta_name: string; details: string; status: Status;
@@ -42,7 +55,7 @@ export type Row = {
 };
 
 /** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
-type DocumentRecord = NseResult & { fileName: string; contentType: string; bytes: number; sha256: string; uploadedAt: string; uploadedBy: string };
+type DocumentRecord = NseResult & { fileName: string; contentType: string; bytes: number; sha256: string; uploadedAt: string; uploadedBy: string; fileId?: string };
 type Documents = Partial<Record<DocumentKind, DocumentRecord>>;
 export const documentsOf = (r: Row): Documents => (r.documents ? (JSON.parse(r.documents) as Documents) : {});
 const MaxDocumentBytes = 3 * 1024 * 1024;
@@ -100,7 +113,7 @@ function listItem(r: Row, names: StaffNames) {
 function shownDetails(d: HufDetails, full: boolean) {
   if (full) return d;
   return {
-    ...d, pan: mask(d.pan), accountNo: mask(d.accountNo), karta: { ...d.karta, pan: mask(d.karta.pan), dateOfBirth: d.karta.dateOfBirth.slice(0, 4) },
+    ...d, pan: mask(d.pan), accountNo: mask(d.accountNo), ...(d.ckycNumber ? { ckycNumber: mask(d.ckycNumber) } : {}), karta: { ...d.karta, pan: mask(d.karta.pan), dateOfBirth: d.karta.dateOfBirth.slice(0, 4) },
     owners: d.owners?.map((o) => ({ ...o, pan: mask(o.pan), dateOfBirth: o.dateOfBirth.slice(0, 4) })),
   };
 }
@@ -114,7 +127,21 @@ function problems(r: Row, nse: NseStatus | null): string[] {
     out.push(`NSE's bank check: ${nse!.bankStatus}${nse!.bankRemark ? ` (${nse!.bankRemark})` : ''}. The account must be in the ${r.entity_type === 'COMPANY' ? "company's" : "HUF's"} name.`);
   }
   for (const [name, s] of Object.entries(nse?.fatca ?? {})) {
-    if (s.status === 'REJECTED') out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the FATCA declaration${s.remark ? `: ${s.remark}` : ''}.`);
+    if (s.status === 'REJECTED') out.push(`${name === 'kfin' ? 'KFin' : 'CAMS'} rejected the FATCA declaration${s.remark ? `: ${s.remark}` : ''}. Correct the FATCA and send it again.`);
+  }
+  const steps = stepsOf(r);
+  if (steps.fatcaCorrection) {
+    out.push(`A corrected FATCA is waiting: the ${who(r)} consents to it, a colleague approves, then it is sent to NSE. Upload the newly signed FATCA form after that.`);
+  }
+  // NSE sends FATCA on to the registrars itself; there is no API to push it. Past a few days it needs NSE support.
+  const sentAt = Date.parse(steps.fatca?.ok ? steps.fatca.at : r.created_at);
+  const stuck = nse?.fatca && nse.fatca.cams.status === 'NOT_SENT' && nse.fatca.kfin.status === 'NOT_SENT';
+  const days = Math.floor((Date.now() - sentAt) / DayMs);
+  if (stuck && !steps.fatcaCorrection && days >= FatcaForwardDays) {
+    out.push(`NSE hasn't sent the FATCA on to CAMS or KFin after ${days} days. Raise it with NSE support (support@nseinvest.com, 1800 210 0940): there is no API to push it.`);
+  }
+  if (nse?.kyc?.failed) {
+    out.push(`NSE's KYC check on the ${entityKind(r)}'s PAN: "${nse.kyc.status}"${nse.kyc.remark ? ` (${nse.kyc.remark})` : ''}. NSE takes orders only once KYC is verified at the KRA (or CKYC).`);
   }
   const docs = documentsOf(r);
   // An AOF uploaded on NSE's portal counts too: the registrars' verdict shows it is there.
@@ -130,6 +157,21 @@ function problems(r: Row, nse: NseStatus | null): string[] {
     }
   }
   return out;
+}
+
+type FileRow = {
+  id: string; kind: string; file_name: string; original_name: string | null; content_type: string; bytes: number; sha256: string;
+  ok: number; status: string; remark: string | null; uploaded_by: string | null; uploaded_at: string;
+};
+/** Every upload for a client, newest first, without the file itself. */
+async function filesOf(id: string, names: Awaited<ReturnType<typeof staffNames>>) {
+  const rows = await all<FileRow>(
+    'SELECT id, kind, file_name, original_name, content_type, bytes, sha256, ok, status, remark, uploaded_by, uploaded_at FROM huf_files WHERE huf_id = ? ORDER BY uploaded_at DESC', id,
+  );
+  return rows.map((f) => ({
+    id: f.id, kind: f.kind, fileName: f.file_name, originalName: f.original_name, contentType: f.content_type, bytes: Number(f.bytes),
+    ok: Boolean(Number(f.ok)), status: f.status, remark: f.remark, uploadedAt: f.uploaded_at, uploadedBy: refOf(names, f.uploaded_by)?.name ?? null,
+  }));
 }
 
 async function detail(id: string, ctx: Ctx) {
@@ -151,13 +193,17 @@ async function detail(id: string, ctx: Ctx) {
     authLink: r.auth_link,
     authLinkError: r.auth_link_error,
     documents: documentsOf(r),
+    files: await filesOf(id, names),
     canUploadDocuments: registered && r.status !== 'CANCELLED',
     lastError: r.last_error,
     problems: problems(r, nse),
     approvedAt: r.approved_at,
     canEdit: !registered && r.status !== 'CANCELLED' && r.status !== 'SUBMITTING',
     canCancel: !registered && r.status !== 'CANCELLED' && r.status !== 'SUBMITTING',
-    canRequestConsent: !registered && (r.status === 'DRAFT' || r.status === 'AWAITING_CONSENT'),
+    canRequestConsent: (!registered || Boolean(stepsOf(r).fatcaCorrection)) && (r.status === 'DRAFT' || r.status === 'AWAITING_CONSENT'),
+    // A FATCA can be corrected until both registrars have accepted it, and not while a correction is already under way.
+    canCorrectFatca: registered && !['CANCELLED', 'SUBMITTING'].includes(r.status) && !stepsOf(r).fatcaCorrection
+      && !(nse?.fatca?.cams.status === 'ACCEPTED' && nse.fatca.kfin.status === 'ACCEPTED'),
     approval: approvalBlock(r, ctx),
     events,
   };
@@ -241,7 +287,10 @@ async function submit(r: Row, ctx: Ctx, allowNewClientCode: boolean): Promise<vo
       await event(r.id, fatca.ok ? 'FATCA_UPLOADED' : 'FATCA_FAILED', ctx.staff!.id, fatca.remark);
       if (!fatca.ok) return await fail('FATCA', fatca.remark ?? fatca.status);
     }
-    await save('AWAITING_KARTA', null);
+    // A corrected FATCA puts an active client back to active; anyone else waits for the karta / signatory.
+    const back: Status = steps.fatcaCorrection?.from === 'ACTIVE' ? 'ACTIVE' : 'AWAITING_KARTA';
+    steps.fatcaCorrection = null;
+    await save(back, null);
   } catch (error) {
     if (!(error instanceof NseError)) throw error;
     await fail('NSE', error.message);
@@ -265,7 +314,8 @@ async function fetchLink(id: string, clientCode: string): Promise<void> {
 async function refreshOne(r: Row): Promise<void> {
   const d = unseal<HufDetails>(r.details);
   const status = await readStatus(d.clientCode, d.pan);
-  const next: Status = status.authorised ? 'ACTIVE' : r.status;
+  // Only a client waiting on the karta becomes active; a FATCA correction in progress keeps its own status.
+  const next: Status = status.authorised && r.status === 'AWAITING_KARTA' ? 'ACTIVE' : r.status;
   await run('UPDATE hufs SET nse_status = ?, status = ?, updated_at = ? WHERE id = ?', JSON.stringify(status), next, nowIso(), r.id);
   const before = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus).fatca : null;
   await hufFatcaNotice(r, before, status.fatca);
@@ -466,6 +516,51 @@ export function hufRoutes(router: Router): void {
     return detail(id, ctx);
   });
 
+  /**
+   * A corrected FATCA for a client already on NSE: the FATCA fields change (formation, income, net worth, the karta or
+   * owners), the identity and bank stay as registered. It then needs the karta's / signatory's consent and a
+   * colleague's approval again, which re-sends FATCA_COMMON only. Masked values sent back unchanged keep what is saved.
+   */
+  router.put('/hufs/:id/fatca', full, manage, async (ctx) => {
+    const id = uuidParam(ctx, 'id');
+    const r = await one<Row>('SELECT * FROM hufs WHERE id = ?', id);
+    if (!r) throw HttpError.notFound('That client could not be found.');
+    if (!onNse(r)) throw HttpError.conflict(`This ${entityKind(r)} is not on NSE yet: edit it instead.`);
+    if (r.status === 'CANCELLED' || r.status === 'SUBMITTING') throw HttpError.conflict(`This ${entityKind(r)} cannot be changed now.`);
+    const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
+    if (nse?.fatca?.cams.status === 'ACCEPTED' && nse.fatca.kfin.status === 'ACCEPTED') throw HttpError.conflict('CAMS and KFin have both accepted this FATCA; there is nothing to correct.');
+    const saved = unseal<HufDetails>(r.details);
+    const b = ctx.body ?? {};
+    const masked = (v: unknown) => typeof v !== 'string' || !v.trim() || v.includes('•');
+    const person = <P extends { pan: string; dateOfBirth: string }>(sent: any, was: P | undefined) => ({
+      ...(was ?? {}), ...(sent ?? {}),
+      pan: was && masked(sent?.pan) ? was.pan : sent?.pan,
+      dateOfBirth: was && (!sent?.dateOfBirth || /^\d{4}$/.test(String(sent.dateOfBirth))) ? was.dateOfBirth : sent?.dateOfBirth,
+    });
+    const input: any = { ...saved };
+    for (const f of FatcaFields) if (f in b) input[f] = b[f];
+    input.karta = person(b.karta, saved.karta);
+    if (Array.isArray(b.owners)) {
+      input.owners = b.owners.map((o: any, i: number) => person(o, saved.owners?.[i] && String(saved.owners[i]!.name).toUpperCase() === String(o?.name ?? "").trim().toUpperCase() ? saved.owners[i] : undefined));
+    }
+    const { details, errors } = readHuf(input);
+    // Only what the correction can change is checked here; the rest is as NSE already holds it.
+    const own = Object.fromEntries(Object.entries(errors).filter(([k]) => fatcaError(k)));
+    if (Object.keys(own).length) throw HttpError.badRequest('Some details need fixing.', { fields: own });
+    const steps = stepsOf(r);
+    steps.fatcaCorrection = { from: r.status, at: nowIso(), by: ctx.staff!.id };
+    steps.fatca = { ok: false, status: 'CORRECTION', remark: 'Corrected FATCA waiting for consent and approval.', at: nowIso() };
+    await run(
+      `UPDATE hufs SET karta_name = ?, details = ?, steps = ?, status = 'DRAFT',
+         consent_token_hash = NULL, consent_expires_at = NULL, consent_ip = NULL, consent_at = NULL, consent_user_agent = NULL,
+         last_error = NULL, updated_at = ? WHERE id = ?`,
+      details.karta.name, seal(details), JSON.stringify(steps), nowIso(), id,
+    );
+    await event(id, 'FATCA_CORRECTION', ctx.staff!.id, `Corrected FATCA prepared: the ${who(r)}'s consent and a colleague's approval are needed to send it.`);
+    await audit(ctx, 'huf.fatca_correction', id);
+    return detail(id, ctx);
+  });
+
   /** A new consent link for the karta. The token is returned once; only its hash is kept. */
   router.post('/hufs/:id/consent-link', full, manage, async (ctx) => {
     const id = uuidParam(ctx, 'id');
@@ -531,6 +626,7 @@ export function hufRoutes(router: Router): void {
     const contentType = String(ctx.body?.contentType ?? '');
     const ext = DocumentTypes[contentType];
     if (!ext) throw HttpError.badRequest('Upload a PDF, JPG, PNG or TIFF.');
+    if (ext === 'png' && !AcceptsPng[kind]) throw HttpError.badRequest('NSE takes this form as a PDF, JPG or TIFF only, not PNG. Save or scan it as a PDF.');
     const data = typeof ctx.body?.data === 'string' ? ctx.body.data : '';
     const file = Buffer.from(data, 'base64');
     if (!file.length) throw HttpError.badRequest('The file is empty.');
@@ -546,9 +642,19 @@ export function hufRoutes(router: Router): void {
       if (error instanceof NseError) throw new HttpError(502, 'NSE_UNAVAILABLE', `Couldn't reach NSE: ${error.message}`);
       throw error;
     }
+    const sha256 = createHash('sha256').update(file).digest('hex');
+    const uploadedAt = nowIso();
+    // The file is kept, sealed, so staff can open exactly what went to NSE (a refused attempt too).
+    const fileId = newId();
+    const originalName = typeof ctx.body?.fileName === 'string' ? ctx.body.fileName.replace(/[^\w .()-]/g, '_').slice(0, 120) || null : null;
+    await run(
+      `INSERT INTO huf_files (id, huf_id, kind, file_name, original_name, content_type, bytes, sha256, data, ok, status, remark, uploaded_by, uploaded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      fileId, id, kind, fileName, originalName, contentType, file.length, sha256, seal(file.toString('base64')), result.ok ? 1 : 0, result.status, result.remark,
+      ctx.staff!.id, uploadedAt,
+    );
     const record: DocumentRecord = {
-      ...result, fileName, contentType, bytes: file.length, sha256: createHash('sha256').update(file).digest('hex'),
-      uploadedAt: nowIso(), uploadedBy: ctx.staff!.id,
+      ...result, fileName, contentType, bytes: file.length, sha256, uploadedAt, uploadedBy: ctx.staff!.id, fileId,
     };
     // A failed attempt is recorded too, but never replaces a copy NSE already accepted.
     const docs = documentsOf(r);
@@ -558,6 +664,17 @@ export function hufRoutes(router: Router): void {
     await audit(ctx, 'huf.document', id, { kind, ok: result.ok, bytes: file.length, sha256: record.sha256 });
     if (!result.ok) throw HttpError.conflict(`NSE did not accept it: ${result.remark ?? result.status}.`);
     return detail(id, ctx);
+  });
+
+  /** One uploaded document, as it was sent to NSE: shown in the browser (PDF or image). Each opening is audited. */
+  router.get('/hufs/:id/documents/:fileId', full, manage, async (ctx) => {
+    const id = uuidParam(ctx, 'id');
+    const fileId = String(ctx.params['fileId'] ?? '');
+    const f = await one<FileRow & { data: string }>('SELECT * FROM huf_files WHERE id = ? AND huf_id = ?', fileId, id);
+    if (!f) throw HttpError.notFound('That document could not be found.');
+    const body = Buffer.from(unseal<string>(f.data), 'base64');
+    await audit(ctx, 'huf.document_viewed', id, { kind: f.kind, fileId, sha256: f.sha256 });
+    return new Download(f.file_name, f.content_type, body, true);
   });
 
   router.post('/hufs/:id/resend-link', full, manage, async (ctx) => {

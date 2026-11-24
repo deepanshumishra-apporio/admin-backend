@@ -214,6 +214,38 @@ export async function upstream<T>(path: string, actor: string, timeoutMs = Timeo
   throw new HttpError(502, 'UPSTREAM_ERROR', 'The app backend could not answer. Try again in a moment.');
 }
 
+/**
+ * An action for an investor (the app backend's ADMIN_API_ACTIONS). The app backend's own answer comes back when it
+ * refuses (a wrong OTP, a SIP that has already stopped, an amount over the limit), with its reason, so staff see why.
+ */
+export async function upstreamPost<T>(path: string, actor: string, body: unknown, timeoutMs = 60_000): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${config.upstreamUrl}${path}`, {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json', 'x-admin-key': config.upstreamKey, 'x-admin-actor': actor },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (cause) {
+    console.error('[upstream] unreachable', path, (cause as Error).message);
+    throw new HttpError(503, 'UPSTREAM_UNREACHABLE', "Can't reach the RiSips app backend right now. Nothing was changed. Try again in a moment.");
+  }
+  const payload = (await response.json().catch(() => null)) as (T & { error?: string; reason?: string; attempts_left?: number }) | null;
+  if (response.ok && payload) return payload;
+  if (response.status === 405) throw new HttpError(409, 'ACTIONS_OFF', 'Actions for investors are switched off on the app backend (ADMIN_API_ACTIONS).');
+  if (response.status === 401 || response.status === 403) {
+    throw new HttpError(502, 'UPSTREAM_REFUSED', 'The app backend refused this admin server (its key or address is not allowed).');
+  }
+  if (response.status >= 400 && response.status < 500 && payload?.error) {
+    const reason = typeof payload.reason === 'string' ? payload.reason : null;
+    throw new HttpError(response.status === 404 ? 404 : response.status === 429 ? 429 : 400, reason ? `OTP_${reason.toUpperCase()}` : 'REFUSED', payload.error,
+      payload.attempts_left !== undefined ? { attemptsLeft: payload.attempts_left } : {});
+  }
+  console.error('[upstream] action error', response.status, path, payload?.error);
+  throw new HttpError(502, 'UPSTREAM_ERROR', payload?.error || 'The fund platform did not confirm it. Check the SIP before trying again.');
+}
+
 /** Every row of a list endpoint, 200 at a time. */
 async function listAll<T>(path: string, actor: string): Promise<T[]> {
   const rows: T[] = [];

@@ -469,7 +469,7 @@ export function complianceRoutes(router: Router): void {
       .filter((a) => !search || [a.title, a.detail, a.investor?.name, a.investor?.email, a.investor?.phone].filter(Boolean).join(' ').toLowerCase().includes(search))
       .sort((x, y) => rank(x.severity) - rank(y.severity) || y.lastDetectedAt.localeCompare(x.lastDetectedAt));
     const { offset, limit } = pageParams(q);
-    return { ...page(rows, offset, limit), summary: await summary(all_) };
+    return { ...page(rows, offset, limit), total: rows.length, offset, summary: await summary(all_) };
   });
 
   router.post('/compliance/scan', full, manage, async (ctx) => {

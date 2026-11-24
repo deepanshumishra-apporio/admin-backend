@@ -13,7 +13,7 @@ process.env['NSE_API_KEY_MEMBER'] = 'test-member-key';
 process.env['NSE_API_SECRET_USER'] = 'test-secret';
 process.env['NSE_EUIN'] = 'E696775';
 
-const { closeDb, migrate, run } = await import('../src/db.ts');
+const { closeDb, migrate, one, run } = await import('../src/db.ts');
 const { seedRoles } = await import('../src/auth.ts');
 const { handle, Router } = await import('../src/http.ts');
 const { hufRoutes } = await import('../src/routes/hufs.ts');
@@ -59,6 +59,7 @@ function fakeNse(path: string, body: any) {
     case 'transaction/NORMAL': return reply({ transaction_details: [{ trxn_status: 'TRXN SUCCESS', trxn_order_id: '463099999999', trxn_remark: ' ' }] });
     case 'registration/product/MANDATE': return reply({ reg_data: [{ reg_status: 'REG_SUCCESS', reg_id: '2026110310001', reg_remark: ' ' }] });
     case 'registration/product/XSIP': return reply({ reg_data: [{ reg_status: 'REG_SUCCESS', reg_id: '202611031000001', reg_remark: ' ' }] });
+    case 'cancellation/XSIP_CAN': return reply({ reg_data: [{ client_code: body.can_data[0].client_code, xsip_reg_no: body.can_data[0].xsip_reg_no, can_status: 'CAN_SUCCESS', can_remark: ' ' }] });
     case 'reports/GET_LINK': return reply({ firstHolderLink: `https://nseinvest.com/mf/${body.productType.toLowerCase()}`, errorMessage: '' });
     default: return Promise.reject(new Error(`unexpected NSE call ${path}`));
   }
@@ -213,6 +214,57 @@ const NavAll = [
   '',
   '118482;INF204K01IE3;-;Nippon India Index Fund - Nifty 50 Plan;Regular Plan;Growth Option;40.5000;03-Nov-2026',
 ].join('\n');
+
+test('a redemption: by amount, units or all units, from a folio it holds; the investor authorises it on NSE', async () => {
+  let r = await call('POST', `/hufs/${hufId}/redeem`, { schemeCode: 'RMFSCBP-GR', folio: '999', by: 'amount', amount: 50 });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error.message, /no units/);
+  r = await call('POST', `/hufs/${hufId}/redeem`, { schemeCode: 'RMFSCBP-GR', folio: '477509747671', by: 'units', units: 9 });
+  assert.equal(r.status, 400);
+  assert.match(r.json.error.message, /holds 2.552 units/);
+  r = await call('POST', `/hufs/${hufId}/redeem`, { schemeCode: 'RMFSCBP-GR', folio: '477509747671', by: 'units', units: 1.5 });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  let order = calls.filter((c) => c.path === 'transaction/NORMAL').at(-1)!.body.transaction_details[0];
+  assert.equal(order.trxn_type, 'R');
+  assert.equal(order.buy_sell_type, '');
+  assert.equal(order.folio_no, '477509747671');
+  assert.equal(order.redemption_units, '1.5');
+  assert.equal(order.order_amount, '');
+  assert.equal(order.all_units, 'N');
+  assert.equal(r.json.data.requests[0].kind, 'REDEMPTION');
+  assert.equal(r.json.data.requests[0].link, 'https://nseinvest.com/mf/red');
+  r = await call('POST', `/hufs/${hufId}/redeem`, { schemeCode: 'RMFSCBP-GR', folio: '477509747671', all: true });
+  order = calls.filter((c) => c.path === 'transaction/NORMAL').at(-1)!.body.transaction_details[0];
+  assert.equal(order.all_units, 'Y');
+  assert.equal(order.order_amount, '', 'all units: amount and units blank');
+  assert.equal(order.redemption_units, '');
+});
+
+test('stopping a SIP: a reason from NSE\'s list, then the investor authorises the cancellation', async () => {
+  const row = await one<{ investments: string }>('SELECT investments FROM hufs WHERE id = ?', hufId);
+  const inv = JSON.parse(row!.investments);
+  inv.sips = [{ registrationNo: '202611031000001', status: 'ACTIVE', schemeName: 'NIPPON INDIA INDEX FUND', amount: 500, frequency: 'MONTHLY', startDate: null, endDate: null, installments: 12, mandateId: '2026110310001', registeredOn: null }];
+  await run('UPDATE hufs SET investments = ? WHERE id = ?', JSON.stringify(inv), hufId);
+  let r = await call('POST', `/hufs/${hufId}/sips/202611031000001/cancel`, { reason: '99' });
+  assert.equal(r.status, 400);
+  r = await call('POST', `/hufs/${hufId}/sips/202611031000001/cancel`, { reason: '13', other: 'Family needs (urgent)' });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const can = calls.filter((c) => c.path === 'cancellation/XSIP_CAN').at(-1)!.body.can_data[0];
+  assert.equal(can.xsip_reg_no, '202611031000001');
+  assert.equal(can.remarks, '13:(Family needs urgent)');
+  assert.equal(r.json.data.requests[0].kind, 'SIP_CANCEL');
+  assert.equal(r.json.data.requests[0].link, 'https://nseinvest.com/mf/xsip_can');
+  assert.equal((await call('POST', `/hufs/${hufId}/sips/1/cancel`, { reason: '01' })).status, 404);
+});
+
+test("NSE's KYC check failing blocks orders", async () => {
+  await run('UPDATE hufs SET nse_status = ? WHERE id = ?', JSON.stringify({ bankStatus: 'ACTIVE', bankRemark: null, fatca: null, authorised: null,
+    aof: { cams: { status: 'ACCEPTED', remark: null }, kfin: { status: 'ACCEPTED', remark: null }, uploadedAt: null },
+    kyc: { status: 'KYC Check failed', remark: null, failed: true }, checkedAt: new Date().toISOString() }), hufId);
+  const r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 500 });
+  assert.equal(r.status, 409);
+  assert.match(r.json.error.message, /KYC check/);
+});
 
 test("AMFI: categories and fund houses by ISIN; returns from a NAV history", () => {
   const byIsin = parseNavAll(NavAll);

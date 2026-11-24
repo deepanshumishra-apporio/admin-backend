@@ -162,3 +162,19 @@ test('CSV escapes quotes and neutralises formulas', () => {
   const csv = toCsv([{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], [{ a: '=HYPERLINK("x")', b: -12.5 }]);
   assert.equal(csv, '﻿A,B\r\n"\'=HYPERLINK(""x"")",-12.5\r\n');
 });
+
+test('dashboard asset classes: by AMFI category, index funds by what they track, ELSS by sub-category or name', async () => {
+  const { assetClassOf, isElss } = await import('../src/valuation.ts');
+  const f = (category: string, sub_category = '', name = 'X') => ({ isin: 'INF000000000', name, category, sub_category });
+  assert.equal(assetClassOf(f('Equity', 'Flexi Cap')), 'EQUITY');
+  assert.equal(assetClassOf(f('Debt', 'Liquid')), 'DEBT');
+  assert.equal(assetClassOf(f('Hybrid', 'Arbitrage')), 'HYBRID');
+  assert.equal(assetClassOf(f('Solution', 'Retirement')), 'HYBRID');
+  assert.equal(assetClassOf(f('Index', 'Index Funds')), 'EQUITY');
+  assert.equal(assetClassOf(f('Index', 'Index Funds - Debt Funds')), 'DEBT');
+  assert.equal(assetClassOf(f('Fund of funds', 'FoF Domestic')), 'OTHER');
+  assert.equal(assetClassOf(null), 'OTHER');
+  assert.ok(isElss(f('Equity', 'ELSS- Tax Saver')));
+  assert.ok(isElss(f('Equity', '', 'Axis ELSS Tax Saver Fund')));
+  assert.ok(!isElss(f('Equity', 'Flexi Cap')));
+});

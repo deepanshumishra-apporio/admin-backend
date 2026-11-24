@@ -9,6 +9,7 @@ export const Permissions = [
   { key: 'investors.read', description: 'Search investors and open their full record, holdings and orders.' },
   { key: 'reports.read', description: 'Preview reports and download them as CSV.' },
   { key: 'transactions.read', description: 'Monitor every order across investors.' },
+  { key: 'sips.manage', description: "Pause, resume, change or cancel an investor's SIP, or redeem, with the investor's OTP." },
   { key: 'support.manage', description: 'Handle support tickets and live chats.' },
   { key: 'compliance.manage', description: 'Work compliance alerts: acknowledge, assign, resolve, dismiss.' },
   { key: 'announcements.manage', description: 'Write announcements and approve colleagues’ ones.' },

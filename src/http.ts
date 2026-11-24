@@ -66,10 +66,13 @@ export class Download {
   readonly filename: string;
   readonly contentType: string;
   readonly body: Buffer;
-  constructor(filename: string, contentType: string, body: Buffer) {
+  /** Shown in the browser (a PDF or image to look at) rather than saved. */
+  readonly inline: boolean;
+  constructor(filename: string, contentType: string, body: Buffer, inline = false) {
     this.filename = filename;
     this.contentType = contentType;
     this.body = body;
+    this.inline = inline;
   }
 }
 
@@ -196,8 +199,10 @@ export async function handle(router: Router, prefix: string, req: IncomingMessag
     if (result instanceof Download) {
       res.writeHead(200, {
         'content-type': result.contentType,
-        'content-disposition': `attachment; filename="${result.filename}"`,
+        'content-disposition': `${result.inline ? 'inline' : 'attachment'}; filename="${result.filename}"`,
         'content-length': result.body.length,
+        // A stored upload is shown as itself, never sniffed into something else.
+        'x-content-type-options': 'nosniff',
         'cache-control': 'no-store',
       });
       res.end(result.body);

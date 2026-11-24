@@ -109,8 +109,30 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   re-sent. Once the UCC is in, the details are locked (a change would need a UCC modification, not built yet).
 - **Documents**: once registered, staff upload the karta's signed AOF (`fileupload/AOFIMG`, needed before a non-demat
   order: a HUF can't have an eLog), the signed FATCA form (`FATCAIMG`) and, if the bank check fails, a cancelled
-  cheque (`CANCELCHEQUE`). PDF/JPG/PNG/TIFF up to 3 MB, checked by file signature, sent straight to NSE; only the
-  name, size and SHA-256 are kept. CAMS/KFin's AOF verdict comes from `AOF_IMAGE_UPLOAD_REPORT`.
+  cheque (`CANCELCHEQUE`). PDF/JPG/TIFF up to 3 MB (PNG for the cheque only: NSE refuses `.png` for the AOF and the
+  FATCA form, "Invalid file extension"), checked by file signature, sent straight to NSE. Every upload
+  (a refused one too) is kept in `huf_files`, sealed with AES-256-GCM under ADMIN_DATA_KEY, and staff can open it as
+  it was sent (`GET /hufs/:id/documents/:fileId`, shown inline, each opening audited as `huf.document_viewed`). Uploads
+  from before 25 Nov 2026 kept only their name, size and SHA-256. CAMS/KFin's AOF verdict comes from `AOF_IMAGE_UPLOAD_REPORT`.
+- **KYC type**: KRA (`K`, the default, as on RSPH000001/2) or CKYC (`C`, with the 14-digit number in
+  `primary_holder_ckyc_number`; RSPC000001 is registered "CKYC COMPLIANT"). Synced clients keep what NSE has.
+- **FATCA correction** (`PUT /hufs/:id/fatca`): for a client already on NSE whose FATCA a registrar rejected, or that NSE
+  holds in an old format (RSPH000002 has no UBO). Only the FATCA fields change (formation, income, net worth, the karta or
+  signatory, owners, listed); identity, bank and contact stay as registered, and masked PANs / dates sent back keep the
+  saved ones. It goes back to DRAFT: new consent link, the karta's / signatory's consent, a colleague's approval, then
+  only `FATCA_COMMON` is re-sent (no UCC) with the new consent in `log_name`, and the client returns to where it was.
+  NSE accepted a re-sent FATCA for the same PAN on production (RSPH000001, 4 Nov 2026). Upload the newly signed FATCA
+  form afterwards (`FATCAIMG`; NSE refuses a second image while one is "under process").
+- **KYC status**: the status job also reads `reports/CLIENT_KYC_REPORT`. NSE's FAQ: a non-demat client orders only once
+  FATCA is present, an eLog or AOF exists and KYC is verified. A failed KYC ("KYC Check failed", rejected, on hold, not
+  available…) shows as a problem and blocks orders. UAT returns no KYC rows at all, so the wording is from production.
+- **FATCA stuck at NSE**: if neither CAMS nor KFin has received the FATCA 5 days after it went in, the record says to
+  raise it with NSE support. NSE forwards FATCA itself; there is no API to push it.
+- **Selling and stopping SIPs**: `POST /hufs/:id/redeem` (`transaction/NORMAL` with `trxn_type R`, from a folio held:
+  an amount, a number of units, or `all_units Y` with amount and units blank) and `POST /hufs/:id/sips/:regNo/cancel`
+  (`cancellation/XSIP_CAN`, a reason from NSE's list, `13:(…)` for other). NSE sends the investor a link to authorise
+  each (`GET_LINK` RED / XSIP_CAN). UAT (24 Nov 2026) accepted both request formats and answered "Client status is
+  inactive" for our inactive test clients; XSIP_CAN replies under `can_data`.
 - **Status job**: every 30 min (`HUF_STATUS_INTERVAL_MS`) HUFs still waiting on NSE are re-read; none waiting, no calls.
 - **Sync from NSE**: HUFs registered on NSE directly (RSPH000001/2 were made on NSE's portal) are found in
   `client_master_report` (7-day windows, from `HUF_SYNC_FROM`, default 2026-10-01; tax status HUF) and added with
@@ -124,8 +146,8 @@ Draft ─▶ consent link ─▶ karta agrees ─▶ colleague approves ─▶ d
   - The authorised signatory takes the karta's place: consent, email, mobile, NSE's links. Designation and CIN are kept.
   - FATCA: `tax_status 04`, `addr_type 4` (registered office), and the beneficial owners as UBO rows: 1-4 people with
     their holding, or one senior managing official (`ubo_categ SMO`, designation in `ubo_smo_de`). A fifth row is
-    refused: 422 "Maximum 4 UBO records are allowed." A listed company sends `ubo_appl N` with `ubo_exch` and
-    `ubo_isin` and no rows. Every shape went in as REG_SUCCESS, also through the dashboard end to end.
+    refused: 422 "Maximum 4 UBO records are allowed." A listed company sends `ubo_appl N`, `ubo_df Y` with `ubo_exch`
+    and `ubo_isin` and no rows (NSE's spec applies the exchange and ISIN only to that pair). Every shape went in as REG_SUCCESS, also through the dashboard end to end.
   - No eLog ("MEMBER IS NOT TRUSTED ALLOWING ONLY TRUSTED MEMBER."). A non-demat order without the AOF is refused
     ("AOF IMAGE IS NOT PRESENT OR NOT VALID OR NOT VERIFIED."); with it, the next gate is the registrars' FATCA
     ("FATCA IS NOT UPLOADED/ REJECTED BY RTA"), which UAT never sends on, so an order can't be proven on UAT.

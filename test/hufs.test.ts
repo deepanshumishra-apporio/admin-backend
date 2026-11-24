@@ -248,6 +248,13 @@ test('a HUF from draft to waiting on the karta', async () => {
   assert.match(r.json.error.message, /not really a PDF/);
   r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/zip', data: pdf });
   assert.equal(r.status, 400);
+  // NSE refuses .png for the AOF and the FATCA form ("Invalid file extension"), so it is stopped here.
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+  for (const kind of ['AOF', 'FATCA_FORM']) {
+    r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind, contentType: 'image/png', data: png });
+    assert.equal(r.status, 400);
+    assert.match(r.json.error.message, /not PNG/);
+  }
   uploadAnswer = { status: '101', message: 'Invalid file' };
   r = await call('asha', 'POST', `/hufs/${id}/documents`, { kind: 'AOF', contentType: 'application/pdf', data: pdf });
   assert.equal(r.status, 409);
@@ -265,7 +272,20 @@ test('a HUF from draft to waiting on the karta', async () => {
   assert.equal(r.json.data.documents.CANCELLED_CHEQUE.ok, true);
   assert.equal(calls.filter((c) => c.path === 'fileupload/CANCELCHEQUE').at(-1)!.body.account_no, '123456789012');
   const docsRow = await one<{ documents: string }>('SELECT documents FROM hufs WHERE id = ?', id);
-  assert.ok(!docsRow!.documents.includes(pdf.slice(0, 20)), 'the file itself is not stored');
+  assert.ok(!docsRow!.documents.includes(pdf.slice(0, 20)), 'the file is not in the HUF row');
+
+  // Every upload is kept, sealed, and can be opened as it was sent: the refused AOF, the accepted one, the cheque.
+  const files = r.json.data.files as { id: string; kind: string; ok: boolean; bytes: number }[];
+  assert.deepEqual(files.map((f) => [f.kind, f.ok]), [['CANCELLED_CHEQUE', true], ['AOF', true], ['AOF', false]]);
+  const storedFile = await one<{ data: string }>('SELECT data FROM huf_files WHERE id = ?', files[1]!.id);
+  assert.ok(storedFile!.data.startsWith('v1.') && !storedFile!.data.includes(pdf.slice(0, 20)), 'sealed at rest');
+  const opened = await fetch(`${base}/api/v1/admin/hufs/${id}/documents/${files[1]!.id}`, { headers: { authorization: `Bearer ${tokens['asha']}` } });
+  assert.equal(opened.status, 200);
+  assert.equal(opened.headers.get('content-type'), 'application/pdf');
+  assert.match(opened.headers.get('content-disposition') ?? '', /^inline; filename="RSPH000003_AOF_/);
+  assert.equal(Buffer.from(await opened.arrayBuffer()).toString('base64'), pdf, 'the same bytes that went to NSE');
+  assert.equal((await fetch(`${base}/api/v1/admin/hufs/${id}/documents/${files[1]!.id}`)).status, 401, 'needs a staff session');
+  assert.equal((await call('asha', 'GET', `/hufs/${id}/documents/00000000-0000-0000-0000-000000000000`)).status, 404);
 
   // The registrars' verdict on the AOF comes back with the status.
   r = await call('asha', 'POST', `/hufs/${id}/refresh`);

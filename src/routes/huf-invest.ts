@@ -12,8 +12,8 @@ import { NseError, nseConfigured } from '../nse/client.ts';
 import { hufInvestmentNotices } from '../notifications.ts';
 import { entityWord, type HufDetails, type NseStatus } from '../nse/huf.ts';
 import {
-  payByNeft, placePurchase, productLink, purchaseProblem, readInvestments, readMandates, registerMandate, registerXsip,
-  schemesFromNse, searchSchemes, sipProblem, type Investments, type Scheme,
+  cancelXsip, payByNeft, placePurchase, placeRedemption, productLink, purchaseProblem, readInvestments, readMandates, redeemProblem,
+  registerMandate, registerXsip, schemesFromNse, searchSchemes, SipCancelReasons, sipProblem, type Investments, type ProductType, type Scheme,
 } from '../nse/invest.ts';
 import { unseal } from '../security.ts';
 import { documentsOf, event, type Row } from './hufs.ts';
@@ -23,7 +23,7 @@ type InvestRow = Row & { investments: string | null; investments_read_at: string
 /** Something started from here, with NSE's link for the karta. */
 type Request = {
   id: string;
-  kind: 'PURCHASE' | 'MANDATE' | 'SIP';
+  kind: 'PURCHASE' | 'MANDATE' | 'SIP' | 'REDEMPTION' | 'SIP_CANCEL';
   nseId: string | null;
   ok: boolean;
   status: string;
@@ -66,6 +66,7 @@ function investBlock(r: InvestRow): string | null {
   const nse = r.nse_status ? (JSON.parse(r.nse_status) as NseStatus) : null;
   if (nse?.bankStatus?.toUpperCase() !== 'ACTIVE') return `NSE hasn't verified the ${word}'s bank account yet. Refresh its status, or upload a cancelled cheque.`;
   const aofAccepted = nse.aof && [nse.aof.cams.status, nse.aof.kfin.status].includes('ACCEPTED');
+  if (nse.kyc?.failed) return `NSE's KYC check on the ${word}'s PAN says "${nse.kyc.status}"${nse.kyc.remark ? ` (${nse.kyc.remark})` : ''}. NSE takes orders only once KYC is verified.`;
   if (!documentsOf(r).AOF?.ok && !aofAccepted) return `Upload the AOF signed by the ${who} first: NSE refuses a ${word}'s order without it ("AOF IMAGE IS NOT PRESENT OR NOT VALID OR NOT VERIFIED").`;
   return null;
 }
@@ -91,6 +92,7 @@ async function view(r: InvestRow) {
     requests: requestsOf(r).map((q) => ({ ...q, by: refOf(names, q.by)?.name ?? null })).reverse(),
     block: investBlock(r),
     live: nseIsLive(),
+    sipCancelReasons: SipCancelReasons,
     approvedMandates: (inv?.mandates ?? []).filter((m) => m.status === 'APPROVED').map((m) => ({ mandateId: m.mandateId, amount: m.amount, endDate: m.endDate, bankName: m.bankName })),
     folios: [...new Map((inv?.holdings ?? []).filter((h) => h.folio).map((h) => [`${h.schemeCode}|${h.folio}`, { schemeCode: h.schemeCode, folio: h.folio! }])).values()],
   };
@@ -319,6 +321,68 @@ export function hufInvestRoutes(router: Router): void {
   });
 
   /**
+   * Sells units from a folio: an amount, a number of units, or everything. NSE sends the investor a link (RED) to
+   * authorise it; the money goes to the registered bank account.
+   */
+  router.post('/hufs/:id/redeem', full, manage, async (ctx) => {
+    const r = await load(uuidParam(ctx, 'id'));
+    const blocked = investBlock(r);
+    if (blocked) throw HttpError.conflict(blocked);
+    const s = await scheme(ctx.body?.schemeCode).catch(nseFailure);
+    const folio = String(ctx.body?.folio ?? '').trim();
+    if (!folio) throw HttpError.badRequest('Choose the folio to redeem from.');
+    const all = ctx.body?.all === true;
+    const by = ctx.body?.by === 'units' ? 'units' : 'amount';
+    const units = !all && by === 'units' ? Number(ctx.body?.units) : null;
+    if (units !== null && (!Number.isFinite(units) || units <= 0)) throw HttpError.badRequest('Enter the number of units (up to 3 decimals).');
+    const amount = !all && by === 'amount' ? amountOf(ctx.body?.amount) : null;
+    // Holdings as NSE last reported them (refreshed daily and on Refresh); NSE checks the units itself too.
+    const inv = r.investments ? (JSON.parse(r.investments) as Investments) : null;
+    const holding = inv?.holdings.find((h) => h.schemeCode === s.schemeCode && h.folio === folio);
+    const input = { scheme: s, folio, amount, units: units === null ? null : Math.round(units * 1000) / 1000, all };
+    const problem = redeemProblem(input, holding);
+    if (problem) throw HttpError.badRequest(problem);
+    const d = unseal<HufDetails>(r.details);
+    const id = uniqueId('HR');
+    const placed = await placeRedemption(d, input, id).catch(nseFailure);
+    const link = placed.ok && placed.orderId ? await productLink('RED', placed.orderId).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
+    const what = all ? 'all units' : input.units !== null ? `${input.units} units` : `₹${amount}`;
+    await record(r, {
+      id, kind: 'REDEMPTION', nseId: placed.orderId, ok: placed.ok, status: placed.status, remark: placed.remark, schemeCode: s.schemeCode, schemeName: s.name,
+      amount: amount ?? 0, detail: { folio, all, units: input.units, by: all ? 'all' : by }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    });
+    await event(r.id, placed.ok ? 'REDEMPTION_PLACED' : 'REDEMPTION_FAILED', ctx.staff!.id, `${s.name}, ${what} from folio ${folio}${placed.orderId ? `, order ${placed.orderId}` : ''}${placed.remark ? `: ${placed.remark}` : ''}`);
+    await audit(ctx, 'huf.redemption', r.id, { schemeCode: s.schemeCode, folio, amount, units: input.units, all, orderId: placed.orderId, ok: placed.ok, live: nseIsLive() });
+    if (!placed.ok) throw HttpError.conflict(`NSE refused the redemption: ${placed.remark ?? placed.status}`);
+    return view(await load(r.id));
+  });
+
+  /** Stops a SIP. NSE sends the investor a link (XSIP_CAN) to authorise the cancellation. */
+  router.post('/hufs/:id/sips/:regNo/cancel', full, manage, async (ctx) => {
+    const r = await load(uuidParam(ctx, 'id'));
+    const regNo = String(ctx.params['regNo'] ?? '').trim();
+    const inv = r.investments ? (JSON.parse(r.investments) as Investments) : null;
+    const sip = inv?.sips.find((x) => x.registrationNo === regNo);
+    if (!sip) throw HttpError.notFound('That SIP could not be found. Refresh the investments and try again.');
+    if (/CANCEL|CEASE|CLOSE|EXPIRE/i.test(sip.status)) throw HttpError.conflict(`This SIP is already ${sip.status.toLowerCase()}.`);
+    const reason = String(ctx.body?.reason ?? '');
+    if (!SipCancelReasons[reason]) throw HttpError.badRequest('Choose why the SIP is being stopped.');
+    const other = String(ctx.body?.other ?? '').trim();
+    if (reason === '13' && other.length < 3) throw HttpError.badRequest('Write the reason.');
+    const d = unseal<HufDetails>(r.details);
+    const result = await cancelXsip(d.clientCode, regNo, reason, other).catch(nseFailure);
+    const link = result.ok ? await productLink('XSIP_CAN', regNo).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
+    await record(r, {
+      id: uniqueId('HC'), kind: 'SIP_CANCEL', nseId: regNo, ok: result.ok, status: result.status, remark: result.remark, schemeCode: null, schemeName: sip.schemeName,
+      amount: sip.amount ?? 0, detail: { reason: SipCancelReasons[reason], other: reason === '13' ? other : null }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    });
+    await event(r.id, result.ok ? 'SIP_CANCEL_REQUESTED' : 'SIP_CANCEL_FAILED', ctx.staff!.id, `${sip.schemeName}, SIP ${regNo}${result.remark ? `: ${result.remark}` : ''}`);
+    await audit(ctx, 'huf.sip_cancel', r.id, { regNo, reason, ok: result.ok, live: nseIsLive() });
+    if (!result.ok) throw HttpError.conflict(`NSE refused the cancellation: ${result.remark ?? result.status}`);
+    return view(await load(r.id));
+  });
+
+  /**
    * Pays a placed purchase by NEFT/RTGS with the bank's UTR, after the investor has transferred the money from its
    * registered account. The way a company pays (NSE has no corporate net banking); a HUF can too.
    */
@@ -346,7 +410,8 @@ export function hufInvestRoutes(router: Router): void {
     const list = requestsOf(r);
     const q = list.find((x) => x.id === ctx.params['requestId']);
     if (!q || !q.ok || !q.nseId) throw HttpError.notFound('That request could not be found.');
-    const type = q.kind === 'PURCHASE' ? 'PUR' : q.kind === 'MANDATE' ? 'MANDATE_AUTH' : 'XSIP_REG';
+    const types: Record<Request['kind'], ProductType> = { PURCHASE: 'PUR', REDEMPTION: 'RED', MANDATE: 'MANDATE_AUTH', SIP: 'XSIP_REG', SIP_CANCEL: 'XSIP_CAN' };
+    const type = types[q.kind];
     const link = await productLink(type, q.nseId).catch(nseFailure);
     q.link = link.link ?? q.link;
     q.linkError = link.link ? null : link.error;
