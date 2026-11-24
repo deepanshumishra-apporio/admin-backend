@@ -1,0 +1,92 @@
+# Put this file in deepanshumishra-apporio/admin-backend at .github/workflows/ci.yml
+#
+#   push / PR to dev  -> checks (typecheck + tests against a throwaway Postgres)
+#   push to prod      -> checks, then deploy that commit to the AWS admin server (admin-api, rolls back by itself
+#                        if /health doesn't answer). Only Akash's pushes deploy: the job's guard refuses anyone else,
+#                        and AWS refuses them too (role risips-admin-deployer trusts only prod + actor akashatbest).
+#
+# Branch rule: Deepanshu works on dev; Akash reviews and merges dev into prod, which is the approval.
+name: CI / deploy
+
+on:
+  push:
+    branches: [dev, prod]
+  pull_request:
+    branches: [dev, prod]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # only the deploy job uses it: GitHub proves to AWS which repo, branch and pusher this is
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/prod' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: admin_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgresql://postgres:ci@localhost:5432/admin_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: checks
+    if: github.ref == 'refs/heads/prod' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-admin-api
+      cancel-in-progress: false
+    steps:
+      - name: Only Akash deploys
+        env:
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ "$ACTOR" != akashatbest ]; then
+            echo "::error::Only akashatbest deploys the admin. Push to dev; Akash merges dev into prod."
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::803888670689:role/risips-admin-deployer
+          aws-region: ap-south-1
+
+      - name: Deploy ${{ github.sha }} on the admin server
+        env:
+          INSTANCE: i-0e1d8cf3687f28291
+        run: |
+          CID=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript \
+            --comment "admin-api ${GITHUB_SHA::7}" \
+            --parameters "commands=[\"/opt/admin/bin/deploy-api.sh ${GITHUB_SHA}\"],executionTimeout=[\"900\"]" \
+            --query Command.CommandId --output text)
+          echo "SSM command $CID"
+          S=Pending
+          for i in $(seq 1 80); do
+            sleep 10
+            S=$(aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || echo Pending)
+            case "$S" in Pending|InProgress|Delayed) ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$CID" --instance-id "$INSTANCE" \
+            --query "[StandardOutputContent,StandardErrorContent]" --output text | tail -40
+          echo "Status: $S"
+          [ "$S" = Success ]
