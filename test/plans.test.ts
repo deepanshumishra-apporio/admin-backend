@@ -105,3 +105,28 @@ test('transactions export: date ranges in India dates, the financial year from 1
   assert.deepEqual(rangeDates('fy', Date.parse('2027-02-10T10:00:00+05:30')), { from: '2026-04-01', to: '2027-02-10' });
   assert.deepEqual(rangeDates('all', at), { from: null, to: null });
 });
+
+test('a modified SIP: the old one says Modified and links to the new one, and the new one links back', async () => {
+  const { sipStatusOf } = await import('../src/routes/sips.ts');
+  const { toPlan } = await import('../src/map.ts');
+  const { uuidFor } = await import('../src/security.ts');
+  const old: UpOrder = { ...sip('successful', {}, 'cancelled'), id: 'mfpp_old', status: 'Modified', replaced_by: 'mfpp_new', cancellation_code: 'invest_later' };
+  const neu: UpOrder = { ...sip('successful', {}, 'active'), id: 'mfpp_new', replaces: 'mfpp_old' };
+  assert.equal(sipStatusOf(old), 'MODIFIED');
+  assert.equal(sipStatusOf(neu), 'ACTIVE');
+  const o = toPlan(old), n = toPlan(neu);
+  assert.equal(o.modified, true);
+  assert.equal(o.replacedById, uuidFor('plan', 'mfpp_new'));
+  assert.equal(o.cancellationReason, 'Modified (replaced by a new SIP)');
+  assert.equal(n.replacesId, uuidFor('plan', 'mfpp_old'));
+  assert.equal(n.modified, false);
+});
+
+test('a plain cancel keeps CANCELLED and its reason in words', async () => {
+  const { sipStatusOf } = await import('../src/routes/sips.ts');
+  const { toPlan } = await import('../src/map.ts');
+  const c: UpOrder = { ...sip('successful', {}, 'cancelled'), cancellation_code: 'amount_not_available' };
+  assert.equal(sipStatusOf(c), 'CANCELLED');
+  assert.equal(toPlan(c).cancellationReason, 'Amount not available');
+  assert.equal(toPlan(c).modified, false);
+});

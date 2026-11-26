@@ -158,6 +158,12 @@ export type UpOrder = {
   installments?: Record<string, unknown>[];
   reason?: string | null;
   mandate_id?: string | number | null;
+  /** A SIP's change history (the app's Modify registers a new plan and cancels the old one): the new plan's id on the
+   *  old one, the old plan's id on the new one. */
+  replaced_by?: string | null;
+  replaces?: string | null;
+  /** Why a stopped plan was cancelled: FP's cancellation code (amount_not_available, invest_later, ...). */
+  cancellation_code?: string | null;
   /** The investor's 2FA OTP for this order: when and how. Null when none was recorded; absent from an older app backend. */
   consent?: { at: string; via: string } | null;
   [key: string]: unknown;

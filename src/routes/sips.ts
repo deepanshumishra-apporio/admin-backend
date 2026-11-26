@@ -6,7 +6,7 @@
 import { actorOf, audit, authenticate, need } from '../auth.ts';
 import { Csv, HttpError, listParam, page, pageParams, toCsv, uuidParam, type Ctx, type Router } from '../http.ts';
 import { snapshot, type Snapshot } from '../investors.ts';
-import { iso, istDate, money, money0, ms, planActive, unitsOf } from '../map.ts';
+import { cancelReasonOf, iso, istDate, money, money0, ms, planActive, unitsOf } from '../map.ts';
 import { uuidFor } from '../security.ts';
 import { investorDetail, portfolio, upstreamPost, type UpOrder } from '../upstream.ts';
 
@@ -19,15 +19,17 @@ const ActionLabels: Record<SipAction, string> = {
 const CancelCodes = ['amount_not_available', 'investment_returns_not_as_expected', 'amc_support_not_satisfactory', 'exit_load_not_as_expected',
   'switch_to_other_scheme', 'fund_manager_changed', 'investment_goal_complete', 'mandate_not_ready', 'invest_later', 'customer_support_not_satisfactory'] as const;
 
-export const SipStatuses = ['ACTIVE', 'PAUSED', 'BOUNCED', 'AWAITING_PAYMENT', 'CANCELLED', 'COMPLETED', 'FAILED'] as const;
+// MODIFIED: cancelled because the investor (or staff) changed it; the app registered a new SIP in its place.
+export const SipStatuses = ['ACTIVE', 'PAUSED', 'BOUNCED', 'AWAITING_PAYMENT', 'CANCELLED', 'MODIFIED', 'COMPLETED', 'FAILED'] as const;
 export type SipStatus = (typeof SipStatuses)[number];
 /** Running: a live plan, whatever its last instalment did. */
 const Running = new Set<SipStatus>(['ACTIVE', 'PAUSED', 'BOUNCED', 'AWAITING_PAYMENT']);
-export const SipFrequencies = ['daily', 'weekly', 'fortnightly', 'monthly', 'quarterly'] as const;
+// daily = every working day, calendar_day_daily = every day (the app's daily SIPs, since 25 Nov 2026)
+export const SipFrequencies = ['daily', 'calendar_day_daily', 'weekly', 'fortnightly', 'monthly', 'quarterly'] as const;
 const Sorts = ['next', 'amount', 'start', 'investor'] as const;
 
 /** How many times a year each frequency debits, to put every SIP on a monthly footing. */
-const PerYear: Record<string, number> = { daily: 250, weekly: 52, fortnightly: 26, monthly: 12, quarterly: 4, half_yearly: 2, yearly: 1 };
+const PerYear: Record<string, number> = { daily: 250, calendar_day_daily: 365, weekly: 52, fortnightly: 26, monthly: 12, quarterly: 4, half_yearly: 2, yearly: 1 };
 const monthly = (amount: number, frequency: string) => (amount * (PerYear[frequency] ?? 12)) / 12;
 
 type Instalment = Record<string, unknown>;
@@ -39,7 +41,7 @@ const when = (i: Instalment) => ms(i['scheduled_on'] ?? i['traded_on'] ?? i['cre
  * instalments now. Awaiting payment: registered, first instalment not paid yet.
  */
 export function sipStatusOf(p: UpOrder): SipStatus {
-  if (p.state === 'cancelled') return 'CANCELLED';
+  if (p.state === 'cancelled') return p.replaced_by ? 'MODIFIED' : 'CANCELLED';
   if (p.state === 'completed' || p.state === 'expired') return 'COMPLETED';
   if (!planActive(p)) return 'FAILED';
   if (p['pause']) return 'PAUSED';
@@ -74,6 +76,10 @@ function rowsOf(snap: Snapshot) {
         /** Null for a SIP that runs until cancelled. */
         installmentsTotal: Number(p.number_of_installments) > 0 && Number(p.number_of_installments) < 1200 ? Number(p.number_of_installments) : null,
         status: sipStatusOf(p),
+        // the SIP this one replaced, and the one that replaced it (Modify), as dashboard ids
+        replacesId: p.replaces ? uuidFor('plan', p.replaces) : null,
+        replacedById: p.replaced_by ? uuidFor('plan', p.replaced_by) : null,
+        cancellationReason: p.state === 'cancelled' ? cancelReasonOf(p) : null,
         createdAt: iso(p.created_at),
         _userId: p.user_id,
         _monthly: monthly(Number(p.amount ?? 0), frequency),

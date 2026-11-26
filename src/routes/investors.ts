@@ -487,7 +487,7 @@ export function investorRoutes(router: Router): void {
           completedAt: p.state === 'completed' ? iso(p.updated_at) : null,
           failedAt: p.state === 'failed' ? iso(p.updated_at) : null,
           autoCancelled: null,
-          cancellationCode: p.state === 'cancelled' ? p.failure_code ?? null : null,
+          cancellationCode: p.state === 'cancelled' ? p.cancellation_code ?? p.failure_code ?? null : null,
           cancellationScheduledOn: null,
           consentAt: iso(p.consent?.at),
           paymentMethod: p.kind === 'sip' ? 'mandate' : null,

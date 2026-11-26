@@ -238,7 +238,26 @@ export function toPlan(p: UpOrder, mandate: UpMandate | null = null) {
     createdAt: iso(p.created_at)!,
     cancelledAt: cancelled ? iso(p.updated_at) : null,
     reason: failureReason(p),
+    // A modified SIP: the app's Modify registers a new plan and cancels this one. Both ends link to each other.
+    modified: cancelled && !!p.replaced_by,
+    replacedById: p.replaced_by ? uuidFor('plan', p.replaced_by) : null,
+    replacesId: p.replaces ? uuidFor('plan', p.replaces) : null,
+    cancellationReason: cancelled ? cancelReasonOf(p) : null,
   };
+}
+
+/** FP's cancellation codes, in words. A modified SIP is cancelled with invest_later, so that one says "Modified". */
+const CancelReasonLabels: Record<string, string> = {
+  amount_not_available: 'Amount not available', investment_returns_not_as_expected: 'Returns not as expected',
+  amc_support_not_satisfactory: 'Fund house support not satisfactory', exit_load_not_as_expected: 'Exit load not as expected',
+  switch_to_other_scheme: 'Switching to another scheme', fund_manager_changed: 'Fund manager changed',
+  investment_goal_complete: 'Investment goal complete', mandate_not_ready: 'AutoPay not ready', invest_later: 'Will invest later',
+  customer_support_not_satisfactory: 'Customer support not satisfactory',
+};
+export function cancelReasonOf(p: UpOrder): string | null {
+  if (p.replaced_by) return 'Modified (replaced by a new SIP)';
+  const code = p.cancellation_code;
+  return code ? CancelReasonLabels[code] ?? humanise(code) : null;
 }
 
 export function planInstallments(p: UpOrder) {
