@@ -214,6 +214,14 @@ export async function upstream<T>(path: string, actor: string, timeoutMs = Timeo
   throw new HttpError(502, 'UPSTREAM_ERROR', 'The app backend could not answer. Try again in a moment.');
 }
 
+/** Errors that mean the connection was never made, so the request never reached the app backend. */
+const ConnectErrors = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+
+export function connectFailed(error: unknown): boolean {
+  const code = (error as { cause?: { code?: string } } | null)?.cause?.code;
+  return typeof code === 'string' && ConnectErrors.has(code);
+}
+
 /**
  * An action for an investor (the app backend's ADMIN_API_ACTIONS). The app backend's own answer comes back when it
  * refuses (a wrong OTP, a SIP that has already stopped, an amount over the limit), with its reason, so staff see why.
@@ -228,8 +236,14 @@ export async function upstreamPost<T>(path: string, actor: string, body: unknown
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (cause) {
-    console.error('[upstream] unreachable', path, (cause as Error).message);
-    throw new HttpError(503, 'UPSTREAM_UNREACHABLE', "Can't reach the RiSips app backend right now. Nothing was changed. Try again in a moment.");
+    console.error('[upstream] no answer', path, (cause as Error).message);
+    // Only a failure to connect proves the request never left. A timeout or a dropped connection can come after the
+    // app backend acted (a redemption placed, a SIP cancelled), so staff must check before trying again.
+    if (connectFailed(cause)) {
+      throw new HttpError(503, 'UPSTREAM_UNREACHABLE', "Can't reach the RiSips app backend right now. Nothing was changed. Try again in a moment.");
+    }
+    throw new HttpError(504, 'UPSTREAM_NO_ANSWER',
+      "The app backend didn't answer in time, so this may or may not have gone through. Check the investor's orders and SIPs before trying again.");
   }
   const payload = (await response.json().catch(() => null)) as (T & { error?: string; reason?: string; attempts_left?: number }) | null;
   if (response.ok && payload) return payload;

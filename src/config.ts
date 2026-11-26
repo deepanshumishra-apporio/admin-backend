@@ -32,7 +32,8 @@ export const config = {
   },
 
   /** Authenticator-app step at sign-in. Off by default, like the original API. */
-  mfaEnabled: env('STAFF_MFA_ENABLED', 'false') === 'true',
+  // Two-factor sign-in for staff: on unless switched off (local development, the demo).
+  mfaEnabled: env('STAFF_MFA_ENABLED', 'true') !== 'false',
   /**
    * Who may set X-Forwarded-For, comma-separated: "loopback" (the dashboard on the same machine), IP addresses of the
    * dashboard's server (e.g. "3.110.2.48"), or "none". The dashboard passes the staff member's own IP so lockouts and
@@ -46,8 +47,8 @@ export const config = {
    */
   dashboardProxyKey: env('DASHBOARD_PROXY_KEY', ''),
 
-  sessionHours: Number(env('STAFF_SESSION_HOURS', '12')),
-  sessionIdleMinutes: Number(env('STAFF_SESSION_IDLE_MINUTES', '60')),
+  sessionHours: Number(env('STAFF_SESSION_HOURS', '24')),
+  sessionIdleMinutes: Number(env('STAFF_SESSION_IDLE_MINUTES', '240')),
   mfaPendingMinutes: 10,
 
   /** How long one staff member's investor/order lists are reused between calls (keeps page renders to one fetch). */

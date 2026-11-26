@@ -8,7 +8,7 @@ import { Csv, HttpError, listParam, page, pageParams, toCsv, uuidParam, type Ctx
 import { snapshot, type Snapshot } from '../investors.ts';
 import { iso, istDate, money, money0, ms, planActive, unitsOf } from '../map.ts';
 import { uuidFor } from '../security.ts';
-import { investorDetail, upstreamPost, type UpOrder } from '../upstream.ts';
+import { investorDetail, portfolio, upstreamPost, type UpOrder } from '../upstream.ts';
 
 /** What staff can do to a SIP. Each is also the OTP action the app backend sends the investor a code for. */
 export const SipActions = ['sip_pause', 'sip_resume', 'sip_modify', 'sip_cancel', 'redeem'] as const;
@@ -188,7 +188,12 @@ function actionCall(plan: UpOrder, action: SipAction, b: Record<string, unknown>
 async function sipDetail(ctx: Ctx, id: string) {
   const { snap, plan } = await findPlan(ctx, id);
   const row = rowsOf({ ...snap, orders: [plan] })[0]!;
-  const detail = await investorDetail(plan.user_id, actorOf(ctx)).catch(() => null);
+  const [detail, port] = await Promise.all([
+    investorDetail(plan.user_id, actorOf(ctx)).catch(() => null),
+    plan.folio ? portfolio(plan.user_id, actorOf(ctx)).catch(() => null) : Promise.resolve(null),
+  ]);
+  // The units this SIP bought, and any others in the same folio and scheme: what a redemption can take.
+  const held = plan.folio ? (port?.holdings ?? []).find((h) => h.folio === plan.folio && h.isin === plan.isin) ?? null : null;
   const mandate = detail?.investor.mandate ?? null;
   const bank = detail?.investor.bank ?? null;
   const list = instalments(plan)
@@ -224,6 +229,9 @@ async function sipDetail(ctx: Ctx, id: string) {
         }
       : null,
     bank: bank ? { bankName: bank.bank_name, accountMasked: bank.account_masked, ifsc: bank.ifsc } : null,
+    holding: held
+      ? { units: unitsOf(held.units), current: money(held.current), redeemable: money(held.redeemable ?? held.current), navDate: held.nav_date ?? null }
+      : null,
   };
 }
 
@@ -295,7 +303,9 @@ export function sipRoutes(router: Router): void {
     const action = oneOf(b['action'], SipActions, 'action');
     const call = actionCall(plan, action, b, otpOf(b['otp']));
     const result = await upstreamPost<{ sip?: { id?: string }; order?: { id?: string; ref?: string } }>(call.path, actorOf(ctx), call.body);
-    await audit(ctx, 'sip.action', null, { sip: plan.ref ?? plan.id, action, summary: call.summary });
+    // Staff's own reason and remarks: kept in the audit log only (the app backend takes FP's cancellation code).
+    const note = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 500) : undefined);
+    await audit(ctx, 'sip.action', null, { sip: plan.ref ?? plan.id, action, summary: call.summary, reason: note(b['reason']), remarks: note(b['remarks']) });
     await snapshot(ctx, { fresh: true }).catch(() => null);
     // A modified SIP is a new plan: open that one next.
     const newPlan = action === 'sip_modify' && result.sip?.id ? uuidFor('plan', result.sip.id) : null;

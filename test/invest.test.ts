@@ -37,6 +37,8 @@ const Sip = [
 
 const calls: { path: string; body: any }[] = [];
 let mandateStatus = 'PENDING';
+/** NSE dropping the order call: the admin can't tell whether it went through. */
+let orderCallFails = false;
 function fakeNse(path: string, body: any) {
   calls.push({ path, body });
   const reply = (b: unknown) => Promise.resolve({ status: 200, body: b });
@@ -56,7 +58,7 @@ function fakeNse(path: string, body: any) {
     case 'reports/MANDATE_STATUS': return reply(calls.some((c) => c.path === 'registration/product/MANDATE')
       ? { response_status: 'S', report_data: [{ mandateId: '2026110310001', clientCode: 'RSPH000001', amount: '100000', status: mandateStatus, endDate: '01/11/2066', bankName: 'IOB' }] }
       : none);
-    case 'transaction/NORMAL': return reply({ transaction_details: [{ trxn_status: 'TRXN SUCCESS', trxn_order_id: '463099999999', trxn_remark: ' ' }] });
+    case 'transaction/NORMAL': if (orderCallFails) return Promise.reject(new Error('socket hang up')); return reply({ transaction_details: [{ trxn_status: 'TRXN SUCCESS', trxn_order_id: '463099999999', trxn_remark: ' ' }] });
     case 'registration/product/MANDATE': return reply({ reg_data: [{ reg_status: 'REG_SUCCESS', reg_id: '2026110310001', reg_remark: ' ' }] });
     case 'registration/product/XSIP': return reply({ reg_data: [{ reg_status: 'REG_SUCCESS', reg_id: '202611031000001', reg_remark: ' ' }] });
     case 'cancellation/XSIP_CAN': return reply({ reg_data: [{ client_code: body.can_data[0].client_code, xsip_reg_no: body.can_data[0].xsip_reg_no, can_status: 'CAN_SUCCESS', can_remark: ' ' }] });
@@ -179,6 +181,37 @@ test('a purchase: checked against the scheme, placed, and the karta gets the pay
   assert.equal(placed.link, 'https://nseinvest.com/mf/pur');
   r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 500, folio: '477509747671' });
   assert.equal(calls.filter((c) => c.path === 'transaction/NORMAL').at(-1)!.body.transaction_details[0].buy_sell_type, 'ADDITIONAL');
+});
+
+test("an order is sent at most once: the same form twice is refused, and NSE not answering leaves a record", async () => {
+  const orders = () => calls.filter((c) => c.path === 'transaction/NORMAL').length;
+  const before = orders();
+  let r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 600, requestKey: 'form-key-0001' });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 600, requestKey: 'form-key-0001' });
+  assert.equal(r.status, 409);
+  assert.match(r.json.error.message, /already sent/);
+  assert.equal(orders(), before + 1, 'the second submit never reached NSE');
+
+  orderCallFails = true;
+  r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 700, requestKey: 'form-key-0002' });
+  orderCallFails = false;
+  assert.equal(r.status, 502);
+  assert.equal(r.json.error.code, 'NSE_NO_ANSWER');
+  assert.match(r.json.error.message, /may or may not have reached NSE/);
+  let view = (await call('GET', `/hufs/${hufId}/investments`)).json.data;
+  assert.equal(view.requests[0].status, 'NO_ANSWER', 'the order NSE never answered is on record');
+  assert.equal(view.requests[0].amount, 700);
+  // The same order again (a new form) waits until staff can see whether NSE has it; a different one goes ahead.
+  const sent = orders();
+  r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 700, requestKey: 'form-key-0003' });
+  assert.equal(r.status, 409);
+  assert.match(r.json.error.message, /no answer from NSE yet/);
+  assert.equal(orders(), sent);
+  r = await call('POST', `/hufs/${hufId}/purchase`, { schemeCode: 'RMFSCBP-GR', amount: 800, requestKey: 'form-key-0004' });
+  assert.equal(r.status, 200);
+  view = r.json.data;
+  assert.equal(view.requests[0].ok, true);
 });
 
 test('a SIP needs an approved mandate; the mandate is eNACH on the HUF account', async () => {

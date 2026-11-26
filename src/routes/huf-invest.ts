@@ -6,7 +6,7 @@ import { randomBytes } from 'node:crypto';
 import { amfiDirectory, amfiDirectoryOrEmpty, isoDate, navHistory, returnsOf, thin, type AmfiFund } from '../amfi.ts';
 import { audit, authenticate, need, refOf, staffNames } from '../auth.ts';
 import { config, nseIsLive } from '../config.ts';
-import { all, nowIso, one, run } from '../db.ts';
+import { all, nowIso, one, run, tx } from '../db.ts';
 import { HttpError, uuidParam, type Ctx, type Router } from '../http.ts';
 import { NseError, nseConfigured } from '../nse/client.ts';
 import { hufInvestmentNotices } from '../notifications.ts';
@@ -38,6 +38,8 @@ type Request = {
   by: string;
   /** A purchase paid by NEFT/RTGS: the UTR sent to NSE and its answer. */
   neft?: { utr: string; ok: boolean; status: string; remark: string | null; at: string; by: string } | null;
+  /** The form's one-time key (see sendOnce): the same form can't be sent twice. */
+  key?: string | null;
 };
 
 const requestsOf = (r: InvestRow): Request[] => (r.requests ? (JSON.parse(r.requests) as Request[]) : []);
@@ -98,10 +100,84 @@ async function view(r: InvestRow) {
   };
 }
 
-async function record(r: InvestRow, q: Request): Promise<void> {
-  const list = requestsOf(r);
-  list.push(q);
-  await run('UPDATE hufs SET requests = ?, updated_at = ? WHERE id = ?', JSON.stringify(list.slice(-200)), nowIso(), r.id);
+/**
+ * Changes the HUF's request list under a row lock, so two actions at once can't overwrite each other's entries (each
+ * reads the list fresh inside the lock, not the copy it loaded before a slow NSE call). `change` returns false to
+ * leave the list as it was.
+ */
+async function changeRequests(hufId: string, change: (list: Request[]) => boolean | void): Promise<void> {
+  await tx(async (q) => {
+    const row = await q.one<{ requests: string | null }>('SELECT requests FROM hufs WHERE id = ? FOR UPDATE', hufId);
+    const list: Request[] = row?.requests ? (JSON.parse(row.requests) as Request[]) : [];
+    if (change(list) === false) return;
+    await q.run('UPDATE hufs SET requests = ?, updated_at = ? WHERE id = ?', JSON.stringify(list.slice(-200)), nowIso(), hufId);
+  });
+}
+
+const updateRequest = (hufId: string, id: string, patch: Partial<Request>): Promise<void> =>
+  changeRequests(hufId, (list) => {
+    const q = list.find((x) => x.id === id);
+    if (!q) return false;
+    Object.assign(q, patch);
+  });
+
+/** How long a request NSE never answered blocks an identical one: time to Refresh and see whether NSE has it. */
+const NoAnswerHoldMs = 15 * 60_000;
+export const NoAnswerRemark =
+  'NSE did not answer, so this may or may not have reached NSE. Press Refresh in a few minutes and check the orders before placing it again.';
+
+/** The form's one-time key, generated when the form is shown. */
+const requestKey = (ctx: Ctx): string | null => {
+  const key = ctx.body?.requestKey;
+  return typeof key === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(key) ? key : null;
+};
+
+const istTime = (at: string) => new Date(at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });
+
+type Outcome = { ok: boolean; status: string; remark: string | null; nseId: string | null; detail?: Record<string, unknown> };
+type Draft = Pick<Request, 'id' | 'kind' | 'schemeCode' | 'schemeName' | 'amount' | 'detail'>;
+
+/**
+ * Sends one order, mandate, SIP or cancellation to NSE at most once (these move real money on live NSE):
+ * - the request is saved as SENDING before NSE is called, so a timeout leaves a record ("NO_ANSWER"), not nothing;
+ * - the same form (its requestKey) can't be sent twice: a double click or a retry is refused;
+ * - an identical request still SENDING, or that NSE never answered, blocks another for 15 minutes.
+ */
+async function sendOnce(r: InvestRow, ctx: Ctx, draft: Draft, linkType: ProductType, send: () => Promise<Outcome>): Promise<Outcome & { link: string | null; linkError: string | null }> {
+  const key = requestKey(ctx);
+  const same = (q: Request) =>
+    q.kind === draft.kind && q.schemeCode === draft.schemeCode && q.amount === draft.amount && JSON.stringify(q.detail) === JSON.stringify(draft.detail);
+  let refusal: string | null = null;
+  await changeRequests(r.id, (list) => {
+    if (key && list.some((q) => q.key === key)) {
+      refusal = 'This was already sent: see "Started from here" on the Transactions tab. Reload the page before starting another.';
+      return false;
+    }
+    const stuck = list.find((q) => (q.status === 'SENDING' || q.status === 'NO_ANSWER') && same(q) && Date.now() - Date.parse(q.at) < NoAnswerHoldMs);
+    if (stuck) {
+      refusal = `The same request sent at ${istTime(stuck.at)} has no answer from NSE yet. Press Refresh to see whether NSE has it; it can be sent again 15 minutes after the first.`;
+      return false;
+    }
+    list.push({ ...draft, key, nseId: null, ok: false, status: 'SENDING', remark: null, link: null, linkError: null, at: nowIso(), by: ctx.staff!.id });
+  });
+  if (refusal) throw HttpError.conflict(refusal);
+
+  let result: Outcome;
+  try {
+    result = await send();
+  } catch (error) {
+    await updateRequest(r.id, draft.id, { status: 'NO_ANSWER', remark: NoAnswerRemark });
+    if (error instanceof NseError) throw new HttpError(502, 'NSE_NO_ANSWER', `${NoAnswerRemark} (NSE: ${error.message})`);
+    throw error;
+  }
+  const link = result.ok && result.nseId
+    ? await productLink(linkType, result.nseId).catch((e: Error) => ({ link: null, error: e.message }))
+    : { link: null, error: null };
+  await updateRequest(r.id, draft.id, {
+    nseId: result.nseId, ok: result.ok, status: result.status, remark: result.remark, link: link.link, linkError: link.error,
+    ...(result.detail ? { detail: { ...draft.detail, ...result.detail } } : {}),
+  });
+  return { ...result, link: link.link, linkError: link.error };
 }
 
 /** A unique id for NSE (member_unique_id / member mandate no / bank ref no): at most 20 characters. */
@@ -257,14 +333,13 @@ export function hufInvestRoutes(router: Router): void {
     if (problem) throw HttpError.badRequest(problem);
     const d = unseal<HufDetails>(r.details);
     const id = uniqueId('HP');
-    const placed = await placePurchase(d, { scheme: s, amount, folio }, id).catch(nseFailure);
-    const link = placed.ok && placed.orderId ? await productLink('PUR', placed.orderId).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
-    await record(r, {
-      id, kind: 'PURCHASE', nseId: placed.orderId, ok: placed.ok, status: placed.status, remark: placed.remark, schemeCode: s.schemeCode, schemeName: s.name,
-      amount, detail: { folio, buyType: folio ? 'ADDITIONAL' : 'FRESH' }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    const draft = { id, kind: 'PURCHASE' as const, schemeCode: s.schemeCode, schemeName: s.name, amount, detail: { folio, buyType: folio ? 'ADDITIONAL' : 'FRESH' } };
+    const placed = await sendOnce(r, ctx, draft, 'PUR', async () => {
+      const p = await placePurchase(d, { scheme: s, amount, folio }, id);
+      return { ok: p.ok, status: p.status, remark: p.remark, nseId: p.orderId };
     });
-    await event(r.id, placed.ok ? 'PURCHASE_PLACED' : 'PURCHASE_FAILED', ctx.staff!.id, `${s.name}, ₹${amount}${placed.orderId ? `, order ${placed.orderId}` : ''}${placed.remark ? `: ${placed.remark}` : ''}`);
-    await audit(ctx, 'huf.purchase', r.id, { schemeCode: s.schemeCode, amount, orderId: placed.orderId, ok: placed.ok, live: nseIsLive() });
+    await event(r.id, placed.ok ? 'PURCHASE_PLACED' : 'PURCHASE_FAILED', ctx.staff!.id, `${s.name}, ₹${amount}${placed.nseId ? `, order ${placed.nseId}` : ''}${placed.remark ? `: ${placed.remark}` : ''}`);
+    await audit(ctx, 'huf.purchase', r.id, { schemeCode: s.schemeCode, amount, orderId: placed.nseId, ok: placed.ok, live: nseIsLive() });
     if (!placed.ok) throw HttpError.conflict(`NSE refused the order: ${placed.remark ?? placed.status}`);
     return view(await load(r.id));
   });
@@ -278,14 +353,13 @@ export function hufInvestRoutes(router: Router): void {
     if (amount < 500 || amount > 10_000_000) throw HttpError.badRequest('The mandate limit is the most one debit can take: between ₹500 and ₹1 crore (₹1 lakh is usual).');
     const d = unseal<HufDetails>(r.details);
     const id = uniqueId('HM');
-    const reg = await registerMandate(d, amount, id).catch(nseFailure);
-    const link = reg.ok && reg.id ? await productLink('MANDATE_AUTH', reg.id).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
-    await record(r, {
-      id, kind: 'MANDATE', nseId: reg.id, ok: reg.ok, status: reg.status, remark: reg.remark, schemeCode: null, schemeName: null, amount,
-      detail: { type: 'eNACH', endDate: reg.endDate, account: `${d.accountNo.slice(-4)} · ${d.ifsc}` }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    const draft = { id, kind: 'MANDATE' as const, schemeCode: null, schemeName: null, amount, detail: { type: 'eNACH', account: `${d.accountNo.slice(-4)} · ${d.ifsc}` } };
+    const reg = await sendOnce(r, ctx, draft, 'MANDATE_AUTH', async () => {
+      const m = await registerMandate(d, amount, id);
+      return { ok: m.ok, status: m.status, remark: m.remark, nseId: m.id, detail: { endDate: m.endDate } };
     });
-    await event(r.id, reg.ok ? 'MANDATE_REGISTERED' : 'MANDATE_FAILED', ctx.staff!.id, `₹${amount} eNACH${reg.id ? `, mandate ${reg.id}` : ''}${reg.remark ? `: ${reg.remark}` : ''}`);
-    await audit(ctx, 'huf.mandate', r.id, { amount, mandateId: reg.id, ok: reg.ok, live: nseIsLive() });
+    await event(r.id, reg.ok ? 'MANDATE_REGISTERED' : 'MANDATE_FAILED', ctx.staff!.id, `₹${amount} eNACH${reg.nseId ? `, mandate ${reg.nseId}` : ''}${reg.remark ? `: ${reg.remark}` : ''}`);
+    await audit(ctx, 'huf.mandate', r.id, { amount, mandateId: reg.nseId, ok: reg.ok, live: nseIsLive() });
     if (!reg.ok) throw HttpError.conflict(`NSE refused the mandate: ${reg.remark ?? reg.status}`);
     return view(await load(r.id));
   });
@@ -308,14 +382,13 @@ export function hufInvestRoutes(router: Router): void {
     const problem = sipProblem(input);
     if (problem) throw HttpError.badRequest(problem);
     const id = uniqueId('HS');
-    const reg = await registerXsip(d, input, id).catch(nseFailure);
-    const link = reg.ok && reg.id ? await productLink('XSIP_REG', reg.id).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
-    await record(r, {
-      id, kind: 'SIP', nseId: reg.id, ok: reg.ok, status: reg.status, remark: reg.remark, schemeCode: s.schemeCode, schemeName: s.name, amount,
-      detail: { startDate, installments, mandateId: mandate.mandateId, frequency: 'MONTHLY' }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    const draft = { id, kind: 'SIP' as const, schemeCode: s.schemeCode, schemeName: s.name, amount, detail: { startDate, installments, mandateId: mandate.mandateId, frequency: 'MONTHLY' } };
+    const reg = await sendOnce(r, ctx, draft, 'XSIP_REG', async () => {
+      const x = await registerXsip(d, input, id);
+      return { ok: x.ok, status: x.status, remark: x.remark, nseId: x.id };
     });
-    await event(r.id, reg.ok ? 'SIP_REGISTERED' : 'SIP_FAILED', ctx.staff!.id, `${s.name}, ₹${amount} a month from ${startDate}, ${installments} instalments${reg.id ? `, ${reg.id}` : ''}${reg.remark ? `: ${reg.remark}` : ''}`);
-    await audit(ctx, 'huf.sip', r.id, { schemeCode: s.schemeCode, amount, installments, startDate, regId: reg.id, ok: reg.ok, live: nseIsLive() });
+    await event(r.id, reg.ok ? 'SIP_REGISTERED' : 'SIP_FAILED', ctx.staff!.id, `${s.name}, ₹${amount} a month from ${startDate}, ${installments} instalments${reg.nseId ? `, ${reg.nseId}` : ''}${reg.remark ? `: ${reg.remark}` : ''}`);
+    await audit(ctx, 'huf.sip', r.id, { schemeCode: s.schemeCode, amount, installments, startDate, regId: reg.nseId, ok: reg.ok, live: nseIsLive() });
     if (!reg.ok) throw HttpError.conflict(`NSE refused the SIP: ${reg.remark ?? reg.status}`);
     return view(await load(r.id));
   });
@@ -344,15 +417,14 @@ export function hufInvestRoutes(router: Router): void {
     if (problem) throw HttpError.badRequest(problem);
     const d = unseal<HufDetails>(r.details);
     const id = uniqueId('HR');
-    const placed = await placeRedemption(d, input, id).catch(nseFailure);
-    const link = placed.ok && placed.orderId ? await productLink('RED', placed.orderId).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
     const what = all ? 'all units' : input.units !== null ? `${input.units} units` : `₹${amount}`;
-    await record(r, {
-      id, kind: 'REDEMPTION', nseId: placed.orderId, ok: placed.ok, status: placed.status, remark: placed.remark, schemeCode: s.schemeCode, schemeName: s.name,
-      amount: amount ?? 0, detail: { folio, all, units: input.units, by: all ? 'all' : by }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    const draft = { id, kind: 'REDEMPTION' as const, schemeCode: s.schemeCode, schemeName: s.name, amount: amount ?? 0, detail: { folio, all, units: input.units, by: all ? 'all' : by } };
+    const placed = await sendOnce(r, ctx, draft, 'RED', async () => {
+      const p = await placeRedemption(d, input, id);
+      return { ok: p.ok, status: p.status, remark: p.remark, nseId: p.orderId };
     });
-    await event(r.id, placed.ok ? 'REDEMPTION_PLACED' : 'REDEMPTION_FAILED', ctx.staff!.id, `${s.name}, ${what} from folio ${folio}${placed.orderId ? `, order ${placed.orderId}` : ''}${placed.remark ? `: ${placed.remark}` : ''}`);
-    await audit(ctx, 'huf.redemption', r.id, { schemeCode: s.schemeCode, folio, amount, units: input.units, all, orderId: placed.orderId, ok: placed.ok, live: nseIsLive() });
+    await event(r.id, placed.ok ? 'REDEMPTION_PLACED' : 'REDEMPTION_FAILED', ctx.staff!.id, `${s.name}, ${what} from folio ${folio}${placed.nseId ? `, order ${placed.nseId}` : ''}${placed.remark ? `: ${placed.remark}` : ''}`);
+    await audit(ctx, 'huf.redemption', r.id, { schemeCode: s.schemeCode, folio, amount, units: input.units, all, orderId: placed.nseId, ok: placed.ok, live: nseIsLive() });
     if (!placed.ok) throw HttpError.conflict(`NSE refused the redemption: ${placed.remark ?? placed.status}`);
     return view(await load(r.id));
   });
@@ -370,11 +442,13 @@ export function hufInvestRoutes(router: Router): void {
     const other = String(ctx.body?.other ?? '').trim();
     if (reason === '13' && other.length < 3) throw HttpError.badRequest('Write the reason.');
     const d = unseal<HufDetails>(r.details);
-    const result = await cancelXsip(d.clientCode, regNo, reason, other).catch(nseFailure);
-    const link = result.ok ? await productLink('XSIP_CAN', regNo).catch((e: Error) => ({ link: null, error: e.message })) : { link: null, error: null };
-    await record(r, {
-      id: uniqueId('HC'), kind: 'SIP_CANCEL', nseId: regNo, ok: result.ok, status: result.status, remark: result.remark, schemeCode: null, schemeName: sip.schemeName,
-      amount: sip.amount ?? 0, detail: { reason: SipCancelReasons[reason], other: reason === '13' ? other : null }, link: link.link, linkError: link.error, at: nowIso(), by: ctx.staff!.id,
+    const draft = {
+      id: uniqueId('HC'), kind: 'SIP_CANCEL' as const, schemeCode: null, schemeName: sip.schemeName, amount: sip.amount ?? 0,
+      detail: { regNo, reason: SipCancelReasons[reason], other: reason === '13' ? other : null },
+    };
+    const result = await sendOnce(r, ctx, draft, 'XSIP_CAN', async () => {
+      const c = await cancelXsip(d.clientCode, regNo, reason, other);
+      return { ok: c.ok, status: c.status, remark: c.remark, nseId: regNo };
     });
     await event(r.id, result.ok ? 'SIP_CANCEL_REQUESTED' : 'SIP_CANCEL_FAILED', ctx.staff!.id, `${sip.schemeName}, SIP ${regNo}${result.remark ? `: ${result.remark}` : ''}`);
     await audit(ctx, 'huf.sip_cancel', r.id, { regNo, reason, ok: result.ok, live: nseIsLive() });
@@ -388,16 +462,40 @@ export function hufInvestRoutes(router: Router): void {
    */
   router.post('/hufs/:id/requests/:requestId/neft', full, manage, async (ctx) => {
     const r = await load(uuidParam(ctx, 'id'));
-    const list = requestsOf(r);
-    const q = list.find((x) => x.id === ctx.params['requestId']);
-    if (!q || q.kind !== 'PURCHASE' || !q.ok || !q.nseId) throw HttpError.notFound('That purchase could not be found.');
-    if (q.neft?.ok) throw HttpError.conflict(`This order is already paid by NEFT (UTR ${q.neft.utr}).`);
+    const requestId = String(ctx.params['requestId'] ?? '');
     const utr = String(ctx.body?.utr ?? '').trim().toUpperCase();
     if (!/^[A-Z0-9]{12,30}$/.test(utr)) throw HttpError.badRequest('Enter the UTR from the bank: 12 to 30 letters and digits (NEFT 16, RTGS 22).');
+    // Claimed under the row lock before NSE is called, so two submits at once can't both send a payment.
+    let orderId: string | null = null;
+    let refusal: HttpError | null = null;
+    await changeRequests(r.id, (list) => {
+      const q = list.find((x) => x.id === requestId);
+      if (!q || q.kind !== 'PURCHASE' || !q.ok || !q.nseId) { refusal = HttpError.notFound('That purchase could not be found.'); return false; }
+      if (q.neft?.ok) { refusal = HttpError.conflict(`This order is already paid by NEFT (UTR ${q.neft.utr}).`); return false; }
+      if ((q.neft?.status === 'SENDING' || q.neft?.status === 'NO_ANSWER') && Date.now() - Date.parse(q.neft.at) < NoAnswerHoldMs) {
+        refusal = HttpError.conflict(`UTR ${q.neft.utr} was sent at ${istTime(q.neft.at)} and NSE hasn't answered yet. Press Refresh before sending it again.`);
+        return false;
+      }
+      orderId = q.nseId;
+      q.neft = { utr, ok: false, status: 'SENDING', remark: null, at: nowIso(), by: ctx.staff!.id };
+    });
+    if (refusal) throw refusal;
     const d = unseal<HufDetails>(r.details);
-    const paid = await payByNeft(d.clientCode, q.nseId, utr).catch(nseFailure);
-    q.neft = { utr, ok: paid.ok, status: paid.status, remark: paid.remark, at: nowIso(), by: ctx.staff!.id };
-    await run('UPDATE hufs SET requests = ? WHERE id = ?', JSON.stringify(list), r.id);
+    const setNeft = (neft: NonNullable<Request['neft']>) => changeRequests(r.id, (list) => {
+      const q = list.find((x) => x.id === requestId);
+      if (!q) return false;
+      q.neft = neft;
+    });
+    let paid: Awaited<ReturnType<typeof payByNeft>>;
+    try {
+      paid = await payByNeft(d.clientCode, orderId!, utr);
+    } catch (error) {
+      await setNeft({ utr, ok: false, status: 'NO_ANSWER', remark: NoAnswerRemark, at: nowIso(), by: ctx.staff!.id });
+      if (error instanceof NseError) throw new HttpError(502, 'NSE_NO_ANSWER', `${NoAnswerRemark} (NSE: ${error.message})`);
+      throw error;
+    }
+    await setNeft({ utr, ok: paid.ok, status: paid.status, remark: paid.remark, at: nowIso(), by: ctx.staff!.id });
+    const q = { nseId: orderId };
     await event(r.id, paid.ok ? 'NEFT_SUBMITTED' : 'NEFT_FAILED', ctx.staff!.id, `Order ${q.nseId}, UTR ${utr}${paid.remark ? `: ${paid.remark}` : ''}`);
     await audit(ctx, 'huf.neft', r.id, { orderId: q.nseId, ok: paid.ok, live: nseIsLive() });
     if (!paid.ok) throw HttpError.conflict(`NSE refused the payment: ${paid.remark ?? paid.status}`);
@@ -413,9 +511,7 @@ export function hufInvestRoutes(router: Router): void {
     const types: Record<Request['kind'], ProductType> = { PURCHASE: 'PUR', REDEMPTION: 'RED', MANDATE: 'MANDATE_AUTH', SIP: 'XSIP_REG', SIP_CANCEL: 'XSIP_CAN' };
     const type = types[q.kind];
     const link = await productLink(type, q.nseId).catch(nseFailure);
-    q.link = link.link ?? q.link;
-    q.linkError = link.link ? null : link.error;
-    await run('UPDATE hufs SET requests = ? WHERE id = ?', JSON.stringify(list), r.id);
+    await updateRequest(r.id, q.id, { link: link.link ?? q.link, linkError: link.link ? null : link.error });
     return view(await load(r.id));
   });
 }

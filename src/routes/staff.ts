@@ -1,5 +1,6 @@
 // Staff accounts and roles.
 import { audit, authenticate, need, PermissionKeys, Permissions, type Permission } from '../auth.ts';
+import { config } from '../config.ts';
 import { all, nowIso, one, run, tx, type Db } from '../db.ts';
 import { HttpError, oneOf, str, uuidParam, type Ctx, type Router } from '../http.ts';
 import { hashPassword, newId, temporaryPassword } from '../security.ts';
@@ -11,6 +12,7 @@ type StaffRow = {
   phone: string | null;
   status: string;
   mfa_enrolled: number;
+  mfa_required: number;
   locked_until: string | null;
   must_change_password: number;
   last_login_at: string | null;
@@ -40,6 +42,9 @@ async function listItem(row: StaffRow) {
     status: row.status,
     roles: await rolesOf(row.id),
     mfaEnrolled: row.mfa_enrolled === 1,
+    /** Whether sign-in asks this person for a second factor: the server setting and their own. */
+    mfaRequired: config.mfaEnabled && row.mfa_required !== 0,
+    mfaOffForPerson: row.mfa_required === 0,
     locked: Boolean(row.locked_until && Date.parse(row.locked_until) > Date.now()),
     mustChangePassword: row.must_change_password === 1,
     lastLoginAt: row.last_login_at,
@@ -229,10 +234,29 @@ export function staffRoutes(router: Router): void {
     if (!(await staffRow(id))) throw HttpError.notFound('That staff member could not be found.');
     await assertCanManage(ctx, id);
     await tx(async (q) => {
-      await q.run('UPDATE staff SET mfa_secret = NULL, mfa_enrolled = 0 WHERE id = ?', id);
+      await q.run('UPDATE staff SET mfa_secret = NULL, mfa_enrolled = 0, mfa_last_counter = NULL WHERE id = ?', id);
+      await q.run('DELETE FROM staff_recovery_codes WHERE staff_id = ?', id);
       await q.run('UPDATE sessions SET revoked_at = ? WHERE staff_id = ? AND revoked_at IS NULL', nowIso(), id);
     });
     await audit(ctx, 'staff.mfa_reset', id);
+    return detail(id);
+  });
+
+  /**
+   * Turns two-factor sign-in on or off for one person. Off: they sign in with the password alone (their authenticator
+   * and recovery codes are kept, for when it is turned back on). On: their sessions end, so the next sign-in asks.
+   */
+  router.post('/staff/:staffId/mfa', full, manageStaff, async (ctx) => {
+    const id = uuidParam(ctx, 'staffId');
+    if (!(await staffRow(id))) throw HttpError.notFound('That staff member could not be found.');
+    await assertCanManage(ctx, id);
+    if (typeof ctx.body?.required !== 'boolean') throw HttpError.badRequest('Say whether two-factor sign-in is required (true or false).');
+    const required = ctx.body.required as boolean;
+    await tx(async (q) => {
+      await q.run('UPDATE staff SET mfa_required = ? WHERE id = ?', required ? 1 : 0, id);
+      if (required) await q.run('UPDATE sessions SET revoked_at = ? WHERE staff_id = ? AND revoked_at IS NULL', nowIso(), id);
+    });
+    await audit(ctx, required ? 'staff.mfa_turned_on' : 'staff.mfa_turned_off', id);
     return detail(id);
   });
 

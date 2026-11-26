@@ -22,7 +22,7 @@ export type Row = Record<string, unknown>;
 const Tables = [
   'roles', 'staff', 'staff_roles', 'sessions', 'login_events', 'audit_log', 'id_map', 'tickets', 'ticket_messages',
   'ticket_events', 'alerts', 'alert_events', 'jobs', 'announcements', 'meetings', 'hufs', 'huf_events', 'notifications',
-  'notification_reads', 'huf_files',
+  'notification_reads', 'huf_files', 'staff_recovery_codes',
 ];
 // Neon's pooled endpoint (PgBouncer) refuses a per-connection search_path, so queries name the schema themselves:
 // a table after FROM / JOIN / INTO / UPDATE is written `schema.table`.
@@ -302,6 +302,20 @@ ALTER TABLE hufs ADD COLUMN IF NOT EXISTS investments_read_at TEXT;
 ALTER TABLE hufs ADD COLUMN IF NOT EXISTS requests TEXT;
 -- HUF (tax status 03) or COMPANY (04): both go through the same onboarding.
 ALTER TABLE hufs ADD COLUMN IF NOT EXISTS entity_type TEXT NOT NULL DEFAULT 'HUF';
+-- The last authenticator step used: the same code can't sign in twice.
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS mfa_last_counter BIGINT;
+-- Two-factor for this person: on (1) unless an administrator turned it off. STAFF_MFA_ENABLED=false turns it off for all.
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS mfa_required INTEGER NOT NULL DEFAULT 1;
+-- One-time recovery codes for two-factor sign-in, as HMACs (security.ts). used_at is set when one signs someone in.
+CREATE TABLE IF NOT EXISTS staff_recovery_codes (
+  code_hash TEXT PRIMARY KEY,
+  staff_id TEXT NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS staff_recovery_codes_staff ON staff_recovery_codes(staff_id);
+-- Who last changed the details or FATCA: like the creator, they may not approve it (HUF_SECOND_APPROVER).
+ALTER TABLE hufs ADD COLUMN IF NOT EXISTS last_edited_by TEXT REFERENCES staff(id);
 -- Every document staff uploaded for a HUF or company, the file itself sealed (AES-256-GCM under ADMIN_DATA_KEY), so
 -- staff can open what was sent to NSE. Failed attempts are kept too, with NSE's answer.
 CREATE TABLE IF NOT EXISTS huf_files (

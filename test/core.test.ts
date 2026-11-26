@@ -5,11 +5,15 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { after, before, test } from 'node:test';
 
 process.env['DB_SCHEMA'] = `admin_test_${randomBytes(4).toString('hex')}`;
+process.env['ADMIN_DATA_KEY'] ??= randomBytes(32).toString('base64');
 
 const { closeDb, migrate, run } = await import('../src/db.ts');
 const { toCsv } = await import('../src/http.ts');
 const { flagOf, iso, factsFor, toMonitored, investorDetail, fatcaRejection } = await import('../src/map.ts');
-const { hashPassword, verifyPassword, uuidFor, extIdOf, flushIds, verifyTotp, newTotpSecret, passwordProblem } = await import('../src/security.ts');
+const {
+  hashPassword, verifyPassword, uuidFor, extIdOf, flushIds, verifyTotp, newTotpSecret, passwordProblem, totpCounter, sealSecret, openSecret,
+} = await import('../src/security.ts');
+const { connectFailed } = await import('../src/upstream.ts');
 const { seedRoles } = await import('../src/auth.ts');
 
 before(async () => {
@@ -74,6 +78,20 @@ test('TOTP matches RFC 6238 and accepts one step of drift', () => {
   const code = String((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, '0');
   assert.ok(verifyTotp(secret, code));
   assert.ok(!verifyTotp(secret, code === '000000' ? '111111' : '000000'));
+  // the step a code belongs to, so the same code can be refused a second time
+  assert.equal(totpCounter(secret, code), Math.floor(Date.now() / 30_000));
+  // secrets are stored sealed; older plain ones still open
+  const sealed = sealSecret(secret);
+  assert.ok(sealed.startsWith('v1.') && !sealed.includes(secret));
+  assert.equal(openSecret(sealed), secret);
+  assert.equal(openSecret(secret), secret);
+});
+
+test('an app backend that never answered may have acted; only a refused connection means nothing changed', () => {
+  const failed = (code: string) => Object.assign(new TypeError('fetch failed'), { cause: { code } });
+  assert.ok(connectFailed(failed('ECONNREFUSED')));
+  assert.ok(!connectFailed(failed('ECONNRESET')));
+  assert.ok(!connectFailed(new DOMException('The operation was aborted due to timeout', 'TimeoutError')));
 });
 
 test('order flags follow the original rules', () => {

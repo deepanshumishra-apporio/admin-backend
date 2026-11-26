@@ -229,6 +229,10 @@ test('a HUF from draft to waiting on the karta', async () => {
   r = await call('vikram', 'POST', `/hufs/${id}/approve`);
   assert.equal(r.json.data.status, 'AWAITING_KARTA');
   assert.equal(r.json.data.authLink, 'https://nse.example/auth/abc');
+  // once sent to NSE, the karta's used link shows nothing any more
+  r = await call(null, 'GET', `/public/huf-consent/${token}`);
+  assert.equal(r.status, 404);
+  assert.match(r.json.error.message, /already been used/);
   assert.equal(calls.filter((c) => c.path === 'registration/CLIENTCOMMON').length, 1);
   assert.equal(calls.filter((c) => c.path === 'registration/FATCA_COMMON').length, 2);
 
@@ -296,6 +300,23 @@ test('a HUF from draft to waiting on the karta', async () => {
   assert.equal((await call('asha', 'POST', `/hufs/${id}/mark-active`, {})).status, 400);
   r = await call('asha', 'POST', `/hufs/${id}/mark-active`, { note: 'Order 463020217893 accepted' });
   assert.equal(r.json.data.status, 'ACTIVE');
+});
+
+test("four eyes: whoever last changed the details can't approve either", async () => {
+  let r = await call('asha', 'POST', '/hufs', { ...huf, clientCode: 'RSPH000007', pan: 'DDDHD1234D' });
+  const id = r.json.data.id as string;
+  // Vikram changes the bank account on Asha's draft, then gets the karta's consent
+  r = await call('vikram', 'PUT', `/hufs/${id}`, { ...huf, clientCode: 'RSPH000007', pan: 'DDDHD1234D', accountNo: '999988887777', accountNoConfirm: '999988887777' });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const token = (await call('vikram', 'POST', `/hufs/${id}/consent-link`)).json.data.token as string;
+  await call(null, 'POST', `/public/huf-consent/${token}`, { agree: true }, { 'x-forwarded-for': '198.51.100.8' });
+  r = await call('vikram', 'POST', `/hufs/${id}/approve`);
+  assert.equal(r.status, 403);
+  assert.match(r.json.error.message, /prepared or last changed/);
+  assert.equal((await call('asha', 'POST', `/hufs/${id}/approve`)).status, 403, 'nor the one who prepared it');
+  // within the hour after consent the karta still sees what they agreed to
+  assert.equal((await call(null, 'GET', `/public/huf-consent/${token}`)).json.data.state, 'GIVEN');
+  await run("UPDATE hufs SET status = 'CANCELLED' WHERE id = ?", id);
 });
 
 test("a loopback or private address is never taken as the karta's", async () => {

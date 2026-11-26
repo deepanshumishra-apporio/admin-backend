@@ -321,7 +321,21 @@ function filtered(snap: Snapshot, query: URLSearchParams): Facts[] {
   const sipDue = query.get('sipDueDays') ? Number(query.get('sipDueDays')) : null;
   const attention = query.get('attention');
   const dueBy = sipDue !== null ? istDate(Date.now() + sipDue * DayMs) : null;
+  // The dashboard's cards (active / inactive, new, ELSS investors), counted the same way as there.
+  const activity = query.get('active');
+  const joined = query.get('joined');
+  const elss = query.get('elss') === 'true';
+  const thisMonth = istMonth(Date.now());
+  const since30 = Date.now() - 30 * DayMs;
+  const breakdowns = elss ? currentBreakdowns() : null;
   return snap.facts.filter((f) => {
+    if ((activity || joined || elss) && f.status === 'DELETED') return false;
+    const isActive = f.currentValue > 0 || f.activeSips > 0;
+    if (activity === 'true' && !isActive) return false;
+    if (activity === 'false' && isActive) return false;
+    if (breakdowns && !breakdowns.get(f.up.id)?.elss) return false;
+    if (joined === 'month' && istMonth(ms(f.up.signed_up_at)) !== thisMonth) return false;
+    if (joined === '30d' && !(ms(f.up.signed_up_at) >= since30)) return false;
     if (search) {
       const hay = [f.up.name, f.up.email, f.up.mobile, f.up.pan_masked, String(f.up.id), f.id].filter(Boolean).join(' ').toLowerCase();
       if (!hay.includes(search)) return false;

@@ -52,6 +52,8 @@ export type Row = {
   /** ADMIN: prepared here. NSE: registered on NSE directly (e.g. on its portal) and found by the sync. */
   source: 'ADMIN' | 'NSE';
   entity_type: EntityType;
+  /** Who last changed the details or prepared a FATCA correction. */
+  last_edited_by?: string | null;
 };
 
 /** The last copy of each signed document sent to NSE. The file itself is not kept: only what identifies it. */
@@ -213,7 +215,10 @@ async function detail(id: string, ctx: Ctx) {
 function approvalBlock(r: Row, ctx: Ctx): string | null {
   if (r.status !== 'CONSENTED' && r.status !== 'NSE_FAILED') return null;
   if (!r.consent_at) return r.entity_type === 'COMPANY' ? "The authorised signatory hasn't given consent yet." : "The karta hasn't given consent yet.";
-  if (config.hufSecondApprover && r.created_by === ctx.staff!.id) return `A colleague has to approve: you prepared this ${r.entity_type === 'COMPANY' ? 'company' : 'HUF'}.`;
+  // Four eyes: whoever prepared it or last changed its details (or FATCA) can't also send it to NSE.
+  if (config.hufSecondApprover && (r.created_by === ctx.staff!.id || r.last_edited_by === ctx.staff!.id)) {
+    return `A colleague has to approve: you prepared or last changed this ${r.entity_type === 'COMPANY' ? 'company' : 'HUF'}.`;
+  }
   if (!nseConfigured()) return 'NSE is not configured on this server.';
   if (nseIsLive() && !config.nse.allowProd) return "This server points at NSE's live account, which is switched off (NSE_ALLOW_PROD).";
   return null;
@@ -413,8 +418,16 @@ async function consentRow(token: string): Promise<Row> {
   if (!/^[A-Za-z0-9_-]{40,60}$/.test(token)) throw HttpError.notFound('This link is not valid.');
   const r = await one<Row>('SELECT * FROM hufs WHERE consent_token_hash = ?', tokenHash(token));
   if (!r || r.status === 'CANCELLED') throw HttpError.notFound('This link is not valid any more. Ask RiSips for a new one.');
+  // A used link stops showing the details: for an hour after consent (so the karta sees it went through), and only
+  // until the client is sent to NSE. Before, it kept showing names, email and masked PAN/bank for good.
+  if (r.consent_at && (r.status !== 'CONSENTED' || Date.now() - Date.parse(r.consent_at) > UsedLinkGraceMs)) {
+    throw HttpError.notFound('This link has already been used: consent was given. Nothing more is needed from you.');
+  }
   return r;
 }
+
+/** How long a used consent link still shows the karta what they agreed to. */
+const UsedLinkGraceMs = 60 * 60_000;
 
 function consentView(r: Row) {
   const d = unseal<HufDetails>(r.details);
@@ -508,8 +521,8 @@ export function hufRoutes(router: Router): void {
     await run(
       `UPDATE hufs SET client_code = ?, huf_name = ?, pan_masked = ?, pan_hash = ?, karta_name = ?, details = ?, entity_type = ?, status = 'DRAFT',
          consent_token_hash = NULL, consent_expires_at = NULL, consent_ip = NULL, consent_at = NULL, consent_user_agent = NULL,
-         last_error = NULL, updated_at = ? WHERE id = ?`,
-      d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), entityTypeOf(d), nowIso(), id,
+         last_error = NULL, last_edited_by = ?, updated_at = ? WHERE id = ?`,
+      d.clientCode, d.hufName, mask(d.pan), panHash(d.pan), d.karta.name, seal(d), entityTypeOf(d), ctx.staff!.id, nowIso(), id,
     );
     await event(id, 'EDITED', ctx.staff!.id, hadConsent ? `Details changed: the ${who(r)}'s consent was cleared and is needed again.` : null);
     await audit(ctx, 'huf.edited', id);
@@ -553,8 +566,8 @@ export function hufRoutes(router: Router): void {
     await run(
       `UPDATE hufs SET karta_name = ?, details = ?, steps = ?, status = 'DRAFT',
          consent_token_hash = NULL, consent_expires_at = NULL, consent_ip = NULL, consent_at = NULL, consent_user_agent = NULL,
-         last_error = NULL, updated_at = ? WHERE id = ?`,
-      details.karta.name, seal(details), JSON.stringify(steps), nowIso(), id,
+         last_error = NULL, last_edited_by = ?, updated_at = ? WHERE id = ?`,
+      details.karta.name, seal(details), JSON.stringify(steps), ctx.staff!.id, nowIso(), id,
     );
     await event(id, 'FATCA_CORRECTION', ctx.staff!.id, `Corrected FATCA prepared: the ${who(r)}'s consent and a colleague's approval are needed to send it.`);
     await audit(ctx, 'huf.fatca_correction', id);

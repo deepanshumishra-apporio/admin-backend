@@ -102,13 +102,46 @@ function totpAt(secret: string, counter: number): string {
 
 /** Accepts the current code and one step either side, for clock drift. */
 export function verifyTotp(secret: string, code: string): boolean {
+  return totpCounter(secret, code) !== null;
+}
+
+/**
+ * The 30-second step a correct code belongs to (current, or one either side), or null. Keeping the last one used
+ * lets sign-in refuse the same code a second time (a code seen over someone's shoulder stays valid for 90 seconds).
+ */
+export function totpCounter(secret: string, code: string): number | null {
   const counter = Math.floor(Date.now() / 30_000);
-  return [-1, 0, 1].some((drift) => {
-    const expected = Buffer.from(totpAt(secret, counter + drift));
-    const given = Buffer.from(code.padEnd(6).slice(0, 6));
-    return timingSafeEqual(expected, given);
+  const given = Buffer.from(code.padEnd(6).slice(0, 6));
+  for (const drift of [-1, 0, 1]) {
+    if (timingSafeEqual(Buffer.from(totpAt(secret, counter + drift)), given)) return counter + drift;
+  }
+  return null;
+}
+
+/** An authenticator secret as stored: sealed (since 2026-11-25), or the plain base32 of older enrolments. */
+export const sealSecret = (secret: string): string => seal(secret);
+export const openSecret = (stored: string): string => (stored.startsWith('v1.') ? unseal<string>(stored) : stored);
+
+// --- recovery codes ---------------------------------------------------------------------------
+// Ten one-time codes, shown once when the authenticator is set up (or made again from the profile). Each signs in
+// once in place of the authenticator, so a lost phone doesn't lock out the last super admin. Kept only as HMACs.
+
+const RecoveryAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O or 1/I to misread
+export const RecoveryCodeCount = 10;
+
+/** "K7QM-4XRT": 8 characters from a 32-letter alphabet (40 bits), shown in two groups. */
+export function newRecoveryCodes(count = RecoveryCodeCount): string[] {
+  return Array.from({ length: count }, () => {
+    const chars = [...randomBytes(8)].map((b) => RecoveryAlphabet[b % 32]).join('');
+    return `${chars.slice(0, 4)}-${chars.slice(4)}`;
   });
 }
+
+/** Upper case, without the dash or spaces: how a typed recovery code is compared. */
+export const normalRecoveryCode = (code: string): string => code.toUpperCase().replace(/[\s-]/g, '');
+export const looksLikeRecoveryCode = (code: string): boolean => new RegExp(`^[${RecoveryAlphabet}]{8}$`).test(normalRecoveryCode(code));
+export const recoveryCodeHash = (code: string): string =>
+  createHmac('sha256', config.dataKey).update(`staff-recovery:${normalRecoveryCode(code)}`).digest('hex');
 
 export const otpauthUri = (secret: string, email: string): string =>
   `otpauth://totp/${encodeURIComponent(`RiSips Admin:${email}`)}?secret=${secret}&issuer=${encodeURIComponent('RiSips Admin')}&algorithm=SHA1&digits=6&period=30`;
